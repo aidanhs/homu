@@ -284,7 +284,37 @@ def github():
 
     event_type = request.headers['X-Github-Event']
 
-    if event_type == 'pull_request_review_comment':
+    if event_type == 'pull_request_review':
+        action = info['action']
+        review_state = info['review']['state']
+        commit_id = info['review']['commit_id']
+        head_sha = info['pull_request']['head']['sha']
+
+        if action == 'submitted' and review_state == 'approved' and commit_id == head_sha: # noqa
+            pull_num = info['pull_request']['number']
+            body = "@{} r+".format(g.my_username)
+            username = info['sender']['login']
+
+            state = g.states[repo_label].get(pull_num)
+            if state:
+                state.title = info['pull_request']['title']
+                state.body = info['pull_request']['body']
+
+                if parse_commands(
+                    body,
+                    username,
+                    repo_cfg,
+                    state,
+                    g.my_username,
+                    g.db,
+                    g.states,
+                    realtime=True,
+                    sha=commit_id,
+                ):
+                    state.save()
+                    g.queue_handler()
+
+    elif event_type == 'pull_request_review_comment':
         action = info['action']
         original_commit_id = info['comment']['original_commit_id']
         head_sha = info['pull_request']['head']['sha']
@@ -408,7 +438,7 @@ def github():
 
             state.save()
 
-        else:
+        elif not action.starts_with("review_"):
             lazy_debug(logger, lambda: 'Invalid pull_request action: {}'.format(action))  # noqa
 
     elif event_type == 'push':
