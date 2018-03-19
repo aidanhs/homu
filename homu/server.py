@@ -438,7 +438,7 @@ def github():
 
             state.save()
 
-        elif not action.starts_with("review_"):
+        elif not action.startswith("review_"):
             lazy_debug(logger, lambda: 'Invalid pull_request action: {}'.format(action))  # noqa
 
     elif event_type == 'push':
