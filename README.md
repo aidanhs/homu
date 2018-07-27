@@ -135,3 +135,9 @@ the name of the repository you are configuring homu for.
 $ . .venv/bin/activate
 $ homu
 ```
+
+## Deploying Servo's Homu
+
+After merging a change to this repo, updated the pinned hash in [Salt].
+
+[Salt]: https://github.com/servo/saltfs/blob/master/homu/map.jinja
