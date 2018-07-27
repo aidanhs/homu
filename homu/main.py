@@ -118,6 +118,7 @@ class PullReqState:
     base_ref = ''
     assignee = ''
     delegate = ''
+    try_choose = None
 
     def __init__(self, num, head_sha, status, db, repo_label, mergeable_que,
                  gh, owner, name, label_events, repos):
@@ -297,7 +298,7 @@ class PullReqState:
     def save(self):
         db_query(
             self.db,
-            'INSERT OR REPLACE INTO pull (repo, num, status, merge_sha, title, body, head_sha, head_ref, base_ref, assignee, approved_by, priority, try_, rollup, delegate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',  # noqa
+            'INSERT OR REPLACE INTO pull (repo, num, status, merge_sha, title, body, head_sha, head_ref, base_ref, assignee, approved_by, priority, try_, try_choose, rollup, delegate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',  # noqa
             [
                 self.repo_label,
                 self.num,
@@ -312,6 +313,7 @@ class PullReqState:
                 self.approved_by,
                 self.priority,
                 self.try_,
+                self.try_choose,
                 self.rollup,
                 self.delegate,
             ])
@@ -504,7 +506,12 @@ def parse_commands(cfg, body, username, repo_cfg, state, my_username, db,
         elif word in ['try', 'try-'] and realtime:
             if not _try_auth_verified():
                 continue
-            action._try(state, word)
+            action._try(state, word, realtime, repo_cfg)
+
+        elif word.startswith("try=") and realtime:
+            if not _try_auth_verified():
+                continue
+            action._try(state, "try", realtime, repo_cfg, word[len('try='):])
 
         elif word in ['rollup', 'rollup-']:
             if not _try_auth_verified():
@@ -1002,7 +1009,12 @@ def start_build(state, repo_cfgs, buildbot_slots, logger, db, git_cfg):
     only_status_builders = True
     if 'buildbot' in repo_cfg:
         if state.try_:
-            builders += repo_cfg['buildbot']['try_builders']
+            if state.try_choose:
+                builders = (
+                    repo_cfg['buildbot']['try_choosers'][state.try_choose]
+                )
+            else:
+                builders += repo_cfg['buildbot']['try_builders']
         else:
             builders += repo_cfg['buildbot']['builders']
         only_status_builders = False
@@ -1412,6 +1424,7 @@ def main():
         approved_by TEXT,
         priority INTEGER,
         try_ INTEGER,
+        try_choose TEXT,
         rollup INTEGER,
         delegate TEXT,
         UNIQUE (repo, num)
@@ -1447,9 +1460,9 @@ def main():
 
         db_query(
             db,
-            'SELECT num, head_sha, status, title, body, head_ref, base_ref, assignee, approved_by, priority, try_, rollup, delegate, merge_sha FROM pull WHERE repo = ?',   # noqa
+            'SELECT num, head_sha, status, title, body, head_ref, base_ref, assignee, approved_by, priority, try_, try_choose, rollup, delegate, merge_sha FROM pull WHERE repo = ?',   # noqa
             [repo_label])
-        for num, head_sha, status, title, body, head_ref, base_ref, assignee, approved_by, priority, try_, rollup, delegate, merge_sha in db.fetchall():  # noqa
+        for num, head_sha, status, title, body, head_ref, base_ref, assignee, approved_by, priority, try_, try_choose, rollup, delegate, merge_sha in db.fetchall():  # noqa
             state = PullReqState(num, head_sha, status, db, repo_label, mergeable_que, gh, repo_cfg['owner'], repo_cfg['name'], repo_cfg.get('labels', {}), repos)  # noqa
             state.title = title
             state.body = body
@@ -1460,6 +1473,7 @@ def main():
             state.approved_by = approved_by
             state.priority = int(priority)
             state.try_ = bool(try_)
+            state.try_choose = try_choose
             state.rollup = bool(rollup)
             state.delegate = delegate
             builders = []
