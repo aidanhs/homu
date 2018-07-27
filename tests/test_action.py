@@ -52,7 +52,7 @@ class TestAction(unittest.TestCase):
     @patch('homu.main.PullReqState')
     def test_try_positive(self, MockPullReqState):
         state = MockPullReqState()
-        action._try(state, 'try')
+        action._try(state, 'try', False, {})
         self.assertTrue(state.try_)
         state.init_build_res.assert_called_once_with([])
         state.save.assert_called_once_with()
@@ -61,7 +61,7 @@ class TestAction(unittest.TestCase):
     @patch('homu.main.PullReqState')
     def test_try_negative(self, MockPullReqState):
         state = MockPullReqState()
-        action._try(state, 'try-')
+        action._try(state, 'try-', False, {})
         self.assertFalse(state.try_)
         state.init_build_res.assert_called_once_with([])
         state.save.assert_called_once_with()
