@@ -1002,7 +1002,12 @@ def start_build(state, repo_cfgs, buildbot_slots, logger, db, git_cfg):
     repo_cfg = repo_cfgs[state.repo_label]
 
     builders = []
-    branch = 'try' if state.try_ else 'auto'
+    branch = 'auto'
+    if state.try_:
+        if state.try_choose:
+            branch = "try-%s" % state.try_choose
+        else:
+            branch = "try"
     branch = repo_cfg.get('branch', {}).get(branch, branch)
     can_try_travis_exemption = False
 
