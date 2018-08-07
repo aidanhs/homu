@@ -155,7 +155,15 @@ context = 'continuous-integration/travis-ci/push'
 #
 #username = ""
 #password = ""
-
+#
+#
+## Optional try choosers
+## If adding these, be sure to add associated
+## SingleBranchSchedulers for the try-CHOOSERNAME branch
+## in buildbot's master.cfg
+#[repo.NAME.buildbot.try_choosers]
+#mac = ["auto-mac-dev", "auto-mac-rel"]
+#wpt = ["linux-wpt1", "linux-wpt2"]
 #
 ## Boolean which indicates whether the builder is included in try builds (defaults to true)
 #try = false

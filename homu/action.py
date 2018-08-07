@@ -65,10 +65,26 @@ def rollup(state, word):
     state.save()
 
 
-def _try(state, word):
+def _try(state, word, realtime, repo_cfg, choose=None):
     state.try_ = word == 'try'
     state.merge_sha = ''
     state.init_build_res([])
+    state.try_choose = None
+    if choose and state.try_:
+        try:
+            if choose in repo_cfg['buildbot']['try_choosers']:
+                state.try_choose = choose
+            elif realtime:
+                state.add_comment(
+                    ':slightly_frowning_face: There is no try chooser {} for this repo, try one of: {}'  # noqa
+                    .format(choose,
+                        ", ".join(repo_cfg['buildbot']['try_choosers'].keys()))
+                )
+        except KeyError:
+            if realtime:
+                state.add_comment(
+                    ':slightly_frowning_face: This repo does not have try choosers set up'  # noqa
+                )
     state.save()
     if state.try_:
         # `try-` just resets the `try` bit and doesn't correspond to
@@ -188,6 +204,7 @@ def review_approved(state, realtime, approver, username,
     if sha_cmp(sha, state.head_sha):
         state.approved_by = approver
         state.try_ = False
+        state.try_choose = False
         state.set_status('')
 
         state.save()

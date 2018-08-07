@@ -1,7 +1,20 @@
+from collections import OrderedDict
 import unittest
 from unittest.mock import patch, call
 from homu import action
 from homu.action import LabelEvent
+
+
+TRY_CHOOSER_CONFIG = {
+    "buildbot": {
+        "builders": ["mac-rel", "mac-wpt", "linux-wpt-1", "linux-wpt-2"],
+        # keeps the order for testing output
+        "try_choosers": OrderedDict([
+            ("mac", ["mac-rel", "mac-wpt"]),
+            ("wpt", ["linux-wpt-1", "linux-wpt-2"])
+        ])
+    }
+}
 
 class TestAction(unittest.TestCase):
 
@@ -52,7 +65,7 @@ class TestAction(unittest.TestCase):
     @patch('homu.main.PullReqState')
     def test_try_positive(self, MockPullReqState):
         state = MockPullReqState()
-        action._try(state, 'try')
+        action._try(state, 'try', False, {})
         self.assertTrue(state.try_)
         state.init_build_res.assert_called_once_with([])
         state.save.assert_called_once_with()
@@ -61,11 +74,42 @@ class TestAction(unittest.TestCase):
     @patch('homu.main.PullReqState')
     def test_try_negative(self, MockPullReqState):
         state = MockPullReqState()
-        action._try(state, 'try-')
+        action._try(state, 'try-', False, {})
         self.assertFalse(state.try_)
         state.init_build_res.assert_called_once_with([])
         state.save.assert_called_once_with()
         assert not state.change_labels.called, 'change_labels was called and should never be.'
+
+    @patch('homu.main.PullReqState')
+    def test_try_chooser_no_setup(self, MockPullReqState):
+        state = MockPullReqState()
+        action._try(state, 'try', True, {}, choose="foo")
+        self.assertTrue(state.try_)
+        state.init_build_res.assert_called_once_with([])
+        state.save.assert_called_once_with()
+        state.change_labels.assert_called_once_with(LabelEvent.TRY)
+        state.add_comment.assert_called_once_with(":slightly_frowning_face: This repo does not have try choosers set up")
+
+    @patch('homu.main.PullReqState')
+    def test_try_chooser_not_found(self, MockPullReqState):
+        state = MockPullReqState()
+        action._try(state, 'try', True, TRY_CHOOSER_CONFIG, choose="foo")
+        self.assertTrue(state.try_)
+        self.assertEqual(state.try_choose, None)
+        state.init_build_res.assert_called_once_with([])
+        state.save.assert_called_once_with()
+        state.change_labels.assert_called_once_with(LabelEvent.TRY)
+        state.add_comment.assert_called_once_with(":slightly_frowning_face: There is no try chooser foo for this repo, try one of: mac, wpt")
+
+    @patch('homu.main.PullReqState')
+    def test_try_chooser_found(self, MockPullReqState):
+        state = MockPullReqState()
+        action._try(state, 'try', True, TRY_CHOOSER_CONFIG, choose="mac")
+        self.assertTrue(state.try_)
+        self.assertEqual(state.try_choose, "mac")
+        state.init_build_res.assert_called_once_with([])
+        state.save.assert_called_once_with()
+        state.change_labels.assert_called_once_with(LabelEvent.TRY)
 
     @patch('homu.main.PullReqState')
     def test_clean(self, MockPullReqState):
