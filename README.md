@@ -57,7 +57,7 @@ Appveyor support.
 
 [bors]: https://github.com/graydon/bors
 [Webhooks]: https://developer.github.com/webhooks/
-[HttpStatusPush]: http://docs.buildbot.net/current/manual/cfg-statustargets.html#httpstatuspush
+[HttpStatusPush]: http://docs.buildbot.net/0.8.12/manual/cfg-statustargets.html#httpstatuspush
 
 ## Usage
 
