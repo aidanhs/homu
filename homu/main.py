@@ -1023,10 +1023,10 @@ def start_build(state, repo_cfgs, buildbot_slots, logger, db, git_cfg):
         else:
             builders += repo_cfg['buildbot']['builders']
         only_status_builders = False
-    if 'travis' in repo_cfg:
+    if 'travis' in repo_cfg and not state.try_choose:
         builders += ['travis']
         only_status_builders = False
-    if 'status' in repo_cfg:
+    if 'status' in repo_cfg and not state.try_choose:
         found_travis_context = False
         for key, value in repo_cfg['status'].items():
             context = value.get('context')
