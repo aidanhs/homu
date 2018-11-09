@@ -192,7 +192,7 @@ def callback():
             'client_secret': g.cfg['github']['app_client_secret'],
             'code': code,
         })
-    except Exception as ex:
+    except Exception as ex:  # noqa
         logger.warn('/callback encountered an error '
                     'during github oauth callback')
         # probably related to https://gitlab.com/pycqa/flake8/issues/42
@@ -649,7 +649,7 @@ def buildbot():
                                         props['buildnumber'],
                                         step_name,)
                         res = requests.get(url)
-                    except Exception as ex:
+                    except Exception as ex:  # noqa
                         logger.warn('/buildbot encountered an error during '
                                     'github logs request')
                         # probably related to
