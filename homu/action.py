@@ -204,7 +204,7 @@ def review_approved(state, realtime, approver, username,
     if sha_cmp(sha, state.head_sha):
         state.approved_by = approver
         state.try_ = False
-        state.try_choose = False
+        state.try_choose = None
         state.set_status('')
 
         state.save()
