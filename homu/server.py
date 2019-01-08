@@ -73,7 +73,7 @@ def result(repo_label, pull):
     states = [state for state in g.states[repo_label].values()
               if state.num == pull]
     if len(states) == 0:
-        abort(204, 'No build results for pull request {}'.format(pull))
+        return 'No build results for pull request {}'.format(pull)
 
     state = states[0]
     builders = []
@@ -87,7 +87,7 @@ def result(repo_label, pull):
 
         if not data['url']:
             # This happens to old try builds
-            abort(204, 'No build results for pull request {}'.format(pull))
+            return 'No build results for pull request {}'.format(pull)
 
         builders.append({
             'url': data['url'],
