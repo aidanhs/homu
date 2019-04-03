@@ -57,7 +57,7 @@ Appveyor support.
 
 [bors]: https://github.com/graydon/bors
 [Webhooks]: https://developer.github.com/webhooks/
-[HttpStatusPush]: http://docs.buildbot.net/current/manual/cfg-statustargets.html#httpstatuspush
+[HttpStatusPush]: http://docs.buildbot.net/0.8.12/manual/cfg-statustargets.html#httpstatuspush
 
 ## Usage
 
@@ -86,7 +86,7 @@ the name of the repository you are configuring homu for.
    existing account. In the [account settings][settings], go to "OAuth
    applications" and create a new application:
    - Make note of the "Client ID" and "Client Secret"; you will need to put them in
-   your `cgf.toml`.
+   your `cfg.toml`.
    - The OAuth Callback URL should be `http://HOST:PORT/callback`.
    - The homepage URL isn't necessary; you could set `http://HOST:PORT/`.
    
@@ -106,7 +106,7 @@ the name of the repository you are configuring homu for.
    - Payload URL: `http://HOST:PORT/github`
    - Content type: `application/json`
    - Secret: The same as `repo.NAME.github.secret` in `cfg.toml`
-   - Events: `Issue Comment`, `Pull Request`, `Push`, `Status`
+   - Events: `Issue Comment`, `Pull Request`, `Push`, `Status`, `Check runs`
 
 6. Add a Webhook to your continuous integration service, if necessary. You don't
    need this if using Travis/Appveyor.
@@ -135,3 +135,9 @@ the name of the repository you are configuring homu for.
 $ . .venv/bin/activate
 $ homu
 ```
+
+## Deploying Servo's Homu
+
+After merging a change to this repo, updated the pinned hash in [Salt].
+
+[Salt]: https://github.com/servo/saltfs/blob/master/homu/map.jinja

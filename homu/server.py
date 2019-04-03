@@ -8,6 +8,7 @@ from .main import (
     INTERRUPTED_BY_HOMU_RE,
     synchronize,
 )
+from .action import LabelEvent
 from . import utils
 from .utils import lazy_debug
 import github3
@@ -63,6 +64,39 @@ def get_repo(repo_label, repo_cfg):
 def index():
     return g.tpls['index'].render(repos=[g.repos[label]
                                          for label in sorted(g.repos)])
+
+
+@get('/results/<repo_label:path>/<pull:int>')
+def result(repo_label, pull):
+    if repo_label not in g.states:
+        abort(404, 'No such repository: {}'.format(repo_label))
+    states = [state for state in g.states[repo_label].values()
+              if state.num == pull]
+    if len(states) == 0:
+        return 'No build results for pull request {}'.format(pull)
+
+    state = states[0]
+    builders = []
+    repo_url = 'https://github.com/{}/{}'.format(
+        g.cfg['repo'][repo_label]['owner'],
+        g.cfg['repo'][repo_label]['name'])
+    for (builder, data) in state.build_res.items():
+        result = "pending"
+        if data['res'] is not None:
+            result = "success" if data['res'] else "failed"
+
+        if not data['url']:
+            # This happens to old try builds
+            return 'No build results for pull request {}'.format(pull)
+
+        builders.append({
+            'url': data['url'],
+            'result': result,
+            'name': builder,
+        })
+
+    return g.tpls['build_res'].render(repo_label=repo_label, repo_url=repo_url,
+                                      builders=builders, pull=pull)
 
 
 @get('/queue/<repo_label:path>')
@@ -158,11 +192,14 @@ def callback():
             'client_secret': g.cfg['github']['app_client_secret'],
             'code': code,
         })
-    except Exception as ex:
+    except Exception as ex:  # noqa
         logger.warn('/callback encountered an error '
                     'during github oauth callback')
         # probably related to https://gitlab.com/pycqa/flake8/issues/42
-        lazy_debug(logger, lambda: 'github oauth callback err: {}'.format(ex))  # noqa
+        lazy_debug(
+            logger,
+            lambda ex=ex: 'github oauth callback err: {}'.format(ex),
+        )
         abort(502, 'Bad Gateway')
 
     args = urllib.parse.parse_qs(res.text)
@@ -283,7 +320,37 @@ def github():
 
     event_type = request.headers['X-Github-Event']
 
-    if event_type == 'pull_request_review_comment':
+    if event_type == 'pull_request_review':
+        action = info['action']
+        review_state = info['review']['state']
+        commit_id = info['review']['commit_id']
+        head_sha = info['pull_request']['head']['sha']
+
+        if action == 'submitted' and review_state == 'approved' and commit_id == head_sha: # noqa
+            pull_num = info['pull_request']['number']
+            body = "@{} r+".format(g.my_username)
+            username = info['sender']['login']
+
+            state = g.states[repo_label].get(pull_num)
+            if state:
+                state.title = info['pull_request']['title']
+                state.body = info['pull_request']['body']
+
+                if parse_commands(
+                    body,
+                    username,
+                    repo_cfg,
+                    state,
+                    g.my_username,
+                    g.db,
+                    g.states,
+                    realtime=True,
+                    sha=commit_id,
+                ):
+                    state.save()
+                    g.queue_handler()
+
+    elif event_type == 'pull_request_review_comment':
         action = info['action']
         original_commit_id = info['comment']['original_commit_id']
         head_sha = info['pull_request']['head']['sha']
@@ -299,6 +366,7 @@ def github():
                 state.body = info['pull_request']['body']
 
                 if parse_commands(
+                    g.cfg,
                     body,
                     username,
                     repo_cfg,
@@ -328,7 +396,9 @@ def github():
             state = PullReqState(pull_num, head_sha, '', g.db, repo_label,
                                  g.mergeable_que, g.gh,
                                  info['repository']['owner']['login'],
-                                 info['repository']['name'], g.repos)
+                                 info['repository']['name'],
+                                 repo_cfg.get('labels', {}),
+                                 g.repos)
             state.title = info['pull_request']['title']
             state.body = info['pull_request']['body']
             state.head_ref = info['pull_request']['head']['repo']['owner']['login'] + ':' + info['pull_request']['head']['ref']  # noqa
@@ -343,6 +413,7 @@ def github():
                 # FIXME: Review comments are ignored here
                 for c in state.get_repo().issue(pull_num).iter_comments():
                     found = parse_commands(
+                        g.cfg,
                         c.body,
                         c.user.login,
                         repo_cfg,
@@ -405,7 +476,7 @@ def github():
 
             state.save()
 
-        else:
+        elif not action.startswith("review_"):
             lazy_debug(logger, lambda: 'Invalid pull_request action: {}'.format(action))  # noqa
 
     elif event_type == 'push':
@@ -419,6 +490,8 @@ def github():
                 })
 
             if state.head_sha == info['before']:
+                if state.status:
+                    state.change_labels(LabelEvent.PUSHED)
                 state.head_advanced(info['after'])
 
                 state.save()
@@ -435,6 +508,7 @@ def github():
             state.body = info['issue']['body']
 
             if parse_commands(
+                g.cfg,
                 body,
                 username,
                 repo_cfg,
@@ -459,7 +533,7 @@ def github():
             for name, value in repo_cfg['status'].items():
                 if 'context' in value and value['context'] == info['context']:
                     status_name = name
-        if status_name is "":
+        if status_name == "":
             return 'OK'
 
         if info['state'] == 'pending':
@@ -471,6 +545,33 @@ def github():
 
         report_build_res(info['state'] == 'success', info['target_url'],
                          'status-' + status_name, state, logger, repo_cfg)
+
+    elif event_type == 'check_run':
+        try:
+            state, repo_label = find_state(info['check_run']['head_sha'])
+        except ValueError:
+            return 'OK'
+
+        current_run_name = info['check_run']['name']
+        checks_name = None
+        if 'checks' in repo_cfg:
+            for name, value in repo_cfg['checks'].items():
+                if 'name' in value and value['name'] == current_run_name:
+                    checks_name = name
+        if checks_name is None:
+            return 'OK'
+
+        if info['check_run']['status'] != 'completed':
+            return 'OK'
+        if info['check_run']['conclusion'] is None:
+            return 'OK'
+
+        report_build_res(
+            info['check_run']['conclusion'] == 'success',
+            info['check_run']['details_url'],
+            'checks-' + checks_name,
+            state, logger, repo_cfg,
+        )
 
     return 'OK'
 
@@ -499,6 +600,7 @@ def report_build_res(succ, url, builder, state, logger, repo_cfg):
                            ).format(state.approved_by, state.merge_sha,
                                     state.base_ref)
                 state.add_comment(comment)
+                state.change_labels(LabelEvent.SUCCEED)
                 try:
                     try:
                         utils.github_set_ref(state.get_repo(), 'heads/' +
@@ -529,6 +631,7 @@ def report_build_res(succ, url, builder, state, logger, repo_cfg):
                            'State: approved={} try={}'
                            ).format(state.approved_by, state.try_)
                 state.add_comment(comment)
+                state.change_labels(LabelEvent.TRY_SUCCEED)
 
     else:
         if state.status == 'pending':
@@ -540,6 +643,8 @@ def report_build_res(succ, url, builder, state, logger, repo_cfg):
             state.add_comment(':broken_heart: {} - [{}]({})'.format(desc,
                                                                     builder,
                                                                     url))
+            event = LabelEvent.TRY_FAILED if state.try_ else LabelEvent.FAILED
+            state.change_labels(event)
 
     g.queue_handler()
 
@@ -604,12 +709,13 @@ def buildbot():
                                         props['buildnumber'],
                                         step_name,)
                         res = requests.get(url)
-                    except Exception as ex:
+                    except Exception as ex:  # noqa
                         logger.warn('/buildbot encountered an error during '
                                     'github logs request')
-                        # probably related to
-                        # https://gitlab.com/pycqa/flake8/issues/42
-                        lazy_debug(logger, lambda: 'buildbot logs err: {}'.format(ex))  # noqa
+                        lazy_debug(
+                            logger,
+                            lambda ex=ex: 'buildbot logs err: {}'.format(ex),
+                        )
                         abort(502, 'Bad Gateway')
 
                     mat = INTERRUPTED_BY_HOMU_RE.search(res.text)
@@ -625,6 +731,7 @@ def buildbot():
                                 desc = (':snowman: The build was interrupted '
                                         'to prioritize another pull request.')
                                 state.add_comment(desc)
+                                state.change_labels(LabelEvent.INTERRUPTED)
                                 utils.github_create_status(state.get_repo(),
                                                            state.head_sha,
                                                            'error', url,
@@ -680,7 +787,7 @@ def synch(user_gh, state, repo_label, repo_cfg, repo):
     if not repo.is_collaborator(user_gh.user().login):
         abort(400, 'You are not a collaborator')
 
-    Thread(target=synchronize, args=[repo_label, repo_cfg, g.logger,
+    Thread(target=synchronize, args=[repo_label, g.cfg, repo_cfg, g.logger,
                                      g.gh, g.states, g.repos, g.db,
                                      g.mergeable_que, g.my_username,
                                      g.repo_labels]).start()
@@ -692,10 +799,10 @@ def synch_all():
     @retry(wait_exponential_multiplier=1000, wait_exponential_max=600000)
     def sync_repo(repo_label, g):
         try:
-            synchronize(repo_label, g.repo_cfgs[repo_label], g.logger, g.gh,
-                        g.states, g.repos, g.db, g.mergeable_que,
+            synchronize(repo_label, g.cfg, g.repo_cfgs[repo_label], g.logger,
+                        g.gh, g.states, g.repos, g.db, g.mergeable_que,
                         g.my_username, g.repo_labels)
-        except:
+        except Exception:
             print('* Error while synchronizing {}'.format(repo_label))
             traceback.print_exc()
             raise
@@ -719,7 +826,7 @@ def admin():
         g.repo_cfgs[repo_label] = repo_cfg
         g.repo_labels[repo_cfg['owner'], repo_cfg['name']] = repo_label
 
-        Thread(target=synchronize, args=[repo_label, repo_cfg, g.logger,
+        Thread(target=synchronize, args=[repo_label, g.cfg, repo_cfg, g.logger,
                                          g.gh, g.states, g.repos, g.db,
                                          g.mergeable_que, g.my_username,
                                          g.repo_labels]).start()
@@ -768,6 +875,7 @@ def start(cfg, states, queue_handler, repo_cfgs, repos, logger,
     tpls = {}
     tpls['index'] = env.get_template('index.html')
     tpls['queue'] = env.get_template('queue.html')
+    tpls['build_res'] = env.get_template('build_res.html')
 
     g.cfg = cfg
     g.states = states

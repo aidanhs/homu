@@ -4,9 +4,12 @@ import toml
 import json
 import re
 import functools
+from enum import IntEnum
 from . import utils
+from .utils import lazy_debug
+from . import action
 import logging
-from threading import Thread, Lock
+from threading import Thread, Lock, Timer
 import time
 import traceback
 import sqlite3
@@ -16,11 +19,9 @@ from itertools import chain
 from queue import Queue
 import os
 import sys
-from enum import IntEnum
 import subprocess
 from .git_helper import SSH_KEY_FILE
 import shlex
-import random
 
 STATUS_TO_PRIORITY = {
     'success': 0,
@@ -33,9 +34,14 @@ STATUS_TO_PRIORITY = {
 
 INTERRUPTED_BY_HOMU_FMT = 'Interrupted by Homu ({})'
 INTERRUPTED_BY_HOMU_RE = re.compile(r'Interrupted by Homu \((.+?)\)')
-TEST_TIMEOUT = 3600 * 10
+DEFAULT_TEST_TIMEOUT = 3600 * 10
 
-global_cfg = {}
+
+class AuthState(IntEnum):
+    # Higher is more privileged
+    REVIEWER = 3
+    TRY = 2
+    NONE = 1
 
 
 @contextmanager
@@ -112,9 +118,10 @@ class PullReqState:
     base_ref = ''
     assignee = ''
     delegate = ''
+    try_choose = None
 
     def __init__(self, num, head_sha, status, db, repo_label, mergeable_que,
-                 gh, owner, name, repos):
+                 gh, owner, name, label_events, repos):
         self.head_advanced('', use_db=False)
 
         self.num = num
@@ -127,7 +134,9 @@ class PullReqState:
         self.owner = owner
         self.name = name
         self.repos = repos
-        self.test_started = time.time()  # FIXME: Save in the local database
+        self.timeout_timer = None
+        self.test_started = time.time()
+        self.label_events = label_events
 
     def head_advanced(self, head_sha, *, use_db=True):
         self.head_sha = head_sha
@@ -176,8 +185,26 @@ class PullReqState:
     def add_comment(self, text):
         self.get_issue().create_comment(text)
 
+    def change_labels(self, event):
+        event = self.label_events.get(event.value, {})
+        removes = event.get('remove', [])
+        adds = event.get('add', [])
+        unless = event.get('unless', [])
+        if not removes and not adds:
+            return
+
+        issue = self.get_issue()
+        labels = {label.name for label in issue.iter_labels()}
+        if labels.isdisjoint(unless):
+            labels.difference_update(removes)
+            labels.update(adds)
+            issue.replace_labels(list(labels))
+
     def set_status(self, status):
         self.status = status
+        if self.timeout_timer:
+            self.timeout_timer.cancel()
+            self.timeout_timer = None
 
         db_query(
             self.db,
@@ -271,7 +298,7 @@ class PullReqState:
     def save(self):
         db_query(
             self.db,
-            'INSERT OR REPLACE INTO pull (repo, num, status, merge_sha, title, body, head_sha, head_ref, base_ref, assignee, approved_by, priority, try_, rollup, delegate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',  # noqa
+            'INSERT OR REPLACE INTO pull (repo, num, status, merge_sha, title, body, head_sha, head_ref, base_ref, assignee, approved_by, priority, try_, try_choose, rollup, delegate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',  # noqa
             [
                 self.repo_label,
                 self.num,
@@ -286,6 +313,7 @@ class PullReqState:
                 self.approved_by,
                 self.priority,
                 self.try_,
+                self.try_choose,
                 self.rollup,
                 self.delegate,
             ])
@@ -319,20 +347,34 @@ class PullReqState:
         treeclosed = self.repos[self.repo_label].treeclosed
         return treeclosed if self.priority < treeclosed else None
 
+    def start_testing(self, timeout):
+        self.test_started = time.time()     # FIXME: Save in the local database
+        self.set_status('pending')
+        timer = Timer(timeout, self.timed_out)
+        timer.start()
+        self.timeout_timer = timer
 
-def sha_cmp(short, full):
-    return len(short) >= 4 and short == full[:len(short)]
+    def timed_out(self):
+        print('* Test timed out: {}'.format(self))
+
+        self.merge_sha = ''
+        self.save()
+        self.set_status('failure')
+
+        desc = 'Test timed out'
+        utils.github_create_status(
+            self.get_repo(),
+            self.head_sha,
+            'failure',
+            '',
+            desc,
+            context='homu')
+        self.add_comment(':boom: {}'.format(desc))
+        self.change_labels(action.LabelEvent.TIMED_OUT)
 
 
 def sha_or_blank(sha):
     return sha if re.match(r'^[0-9a-f]+$', sha) else ''
-
-
-class AuthState(IntEnum):
-    # Higher is more privileged
-    REVIEWER = 3
-    TRY = 2
-    NONE = 1
 
 
 def verify_auth(username, repo_cfg, state, auth, realtime, my_username):
@@ -370,18 +412,17 @@ def verify_auth(username, repo_cfg, state, auth, realtime, my_username):
                 else:
                     reply += 'Not in reviewers'
             elif auth == AuthState.TRY:
-                    reply += 'and not in try users'
+                reply += 'not in try users'
             state.add_comment(reply)
         return False
 
 
-PORTAL_TURRET_DIALOG = ["Target acquired", "Activated", "There you are"]
-PORTAL_TURRET_IMAGE = "https://cloud.githubusercontent.com/assets/1617736/22222924/c07b2a1c-e16d-11e6-91b3-ac659550585c.png"  # noqa
+def get_words(body, my_username):
+    return list(chain.from_iterable(re.findall(r'\S+', x) for x in body.splitlines() if '@' + my_username in x))  # noqa
 
 
-def parse_commands(body, username, repo_cfg, state, my_username, db, states,
-                   *, realtime=False, sha=''):
-    global global_cfg
+def parse_commands(cfg, body, username, repo_cfg, state, my_username, db,
+                   states, *, realtime=False, sha=''):
     state_changed = False
 
     _reviewer_auth_verified = functools.partial(
@@ -393,6 +434,7 @@ def parse_commands(body, username, repo_cfg, state, my_username, db, states,
         realtime,
         my_username,
     )
+
     _try_auth_verified = functools.partial(
         verify_auth,
         username,
@@ -403,12 +445,12 @@ def parse_commands(body, username, repo_cfg, state, my_username, db, states,
         my_username,
     )
 
-    words = list(chain.from_iterable(re.findall(r'\S+', x) for x in body.splitlines() if '@' + my_username in x))  # noqa
+    words = get_words(body, my_username)
     if words[1:] == ["are", "you", "still", "there?"] and realtime:
-        state.add_comment(
-            ":cake: {}\n\n![]({})".format(
-                random.choice(PORTAL_TURRET_DIALOG), PORTAL_TURRET_IMAGE)
-            )
+        action.still_here(state)
+
+    # reverse the list, as usually the review status
+    # is indicated at the end of the comment.
     for i, word in reversed(list(enumerate(words))):
         found = True
         if word == 'r+' or word.startswith('r='):
@@ -419,233 +461,92 @@ def parse_commands(body, username, repo_cfg, state, my_username, db, states,
                 cur_sha = sha_or_blank(words[i + 1])
             else:
                 cur_sha = sha
-
             approver = word[len('r='):] if word.startswith('r=') else username
 
-            # Ignore "r=me"
-            if approver == 'me':
+            if not action.review_approved(state, realtime, approver, username,
+                                          my_username, cur_sha, states):
                 continue
-
-            # Ignore WIP PRs
-            if any(map(state.title.startswith, [
-                'WIP', 'TODO', '[WIP]', '[TODO]',
-            ])):
-                if realtime:
-                    state.add_comment(':clipboard: Looks like this PR is still in progress, ignoring approval')  # noqa
-                continue
-
-            # Sometimes, GitHub sends the head SHA of a PR as 0000000
-            # through the webhook. This is called a "null commit", and
-            # seems to happen when GitHub internally encounters a race
-            # condition. Last time, it happened when squashing commits
-            # in a PR. In this case, we just try to retrieve the head
-            # SHA manually.
-            if all(x == '0' for x in state.head_sha):
-                if realtime:
-                    state.add_comment(
-                        ':bangbang: Invalid head SHA found, retrying: `{}`'
-                        .format(state.head_sha)
-                    )
-
-                state.head_sha = state.get_repo().pull_request(state.num).head.sha  # noqa
-                state.save()
-
-                assert any(x != '0' for x in state.head_sha)
-
-            if state.approved_by and realtime and username != my_username:
-                for _state in states[state.repo_label].values():
-                    if _state.status == 'pending':
-                        break
-                else:
-                    _state = None
-
-                lines = []
-
-                if state.status in ['failure', 'error']:
-                    lines.append('- This pull request previously failed. You should add more commits to fix the bug, or use `retry` to trigger a build again.')  # noqa
-
-                if _state:
-                    if state == _state:
-                        lines.append('- This pull request is currently being tested. If there\'s no response from the continuous integration service, you may use `retry` to trigger a build again.')  # noqa
-                    else:
-                        lines.append('- There\'s another pull request that is currently being tested, blocking this pull request: #{}'.format(_state.num))  # noqa
-
-                if lines:
-                    lines.insert(0, '')
-                lines.insert(0, ':bulb: This pull request was already approved, no need to approve it again.')  # noqa
-
-                state.add_comment('\n'.join(lines))
-
-            if sha_cmp(cur_sha, state.head_sha):
-                state.approved_by = approver
-                state.try_ = False
-                state.set_status('')
-
-                state.save()
-            elif realtime and username != my_username:
-                if cur_sha:
-                    msg = '`{}` is not a valid commit SHA.'.format(cur_sha)
-                    state.add_comment(
-                        ':scream_cat: {} Please try again with `{:.7}`.'
-                        .format(msg, state.head_sha)
-                    )
-                else:
-                    state.add_comment(
-                        ':pushpin: Commit {:.7} has been approved by `{}`\n\n<!-- @{} r={} {} -->'  # noqa
-                        .format(
-                            state.head_sha,
-                            approver,
-                            my_username,
-                            approver,
-                            state.head_sha,
-                    ))
-                    treeclosed = state.blocked_by_closed_tree()
-                    if treeclosed:
-                        state.add_comment(
-                            ':evergreen_tree: The tree is currently closed for pull requests below priority {}, this pull request will be tested once the tree is reopened'  # noqa
-                            .format(treeclosed)
-                        )
 
         elif word == 'r-':
-            if not verify_auth(username, repo_cfg, state, AuthState.REVIEWER,
-                               realtime, my_username):
+            if not _reviewer_auth_verified():
                 continue
-
-            state.approved_by = ''
-
-            state.save()
+            action.review_rejected(state, realtime)
 
         elif word.startswith('p='):
-            if not verify_auth(username, repo_cfg, state, AuthState.TRY,
-                               realtime, my_username):
+            if not _try_auth_verified():
                 continue
-            try:
-                pvalue = int(word[len('p='):])
-            except ValueError:
+            if not action.set_priority(state, realtime, word[len('p='):], cfg):
                 continue
-
-            if pvalue > global_cfg['max_priority']:
-                if realtime:
-                    state.add_comment(
-                        ':stop_sign: Priority higher than {} is ignored.'
-                        .format(global_cfg['max_priority'])
-                    )
-                continue
-            state.priority = pvalue
-            state.save()
 
         elif word.startswith('delegate='):
-            if not verify_auth(username, repo_cfg, state, AuthState.REVIEWER,
-                               realtime, my_username):
+            if not _reviewer_auth_verified():
                 continue
-
-            state.delegate = word[len('delegate='):]
-            state.save()
-
-            if realtime:
-                state.add_comment(
-                    ':v: @{} can now approve this pull request'
-                    .format(state.delegate)
-                )
+            action.delegate_to(state, realtime, word[len('delegate='):])
 
         elif word == 'delegate-':
             # TODO: why is this a TRY?
             if not _try_auth_verified():
                 continue
-            state.delegate = ''
-            state.save()
+            action.delegate_negative(state)
 
         elif word == 'delegate+':
             if not _reviewer_auth_verified():
                 continue
-
-            state.delegate = state.get_repo().pull_request(state.num).user.login  # noqa
-            state.save()
-
-            if realtime:
-                state.add_comment(
-                    ':v: @{} can now approve this pull request'
-                    .format(state.delegate)
-                )
+            action.delegate_positive(state,
+                                     state.get_repo().
+                                     pull_request(state.num).
+                                     user.login,
+                                     realtime)
 
         elif word == 'retry' and realtime:
             if not _try_auth_verified():
                 continue
-            state.set_status('')
+            action.retry(state)
 
         elif word in ['try', 'try-'] and realtime:
             if not _try_auth_verified():
                 continue
-            state.try_ = word == 'try'
+            action._try(state, word, realtime, repo_cfg)
 
-            state.merge_sha = ''
-            state.init_build_res([])
-
-            state.save()
+        elif word.startswith("try=") and realtime:
+            if not _try_auth_verified():
+                continue
+            action._try(state, "try", realtime, repo_cfg, word[len('try='):])
 
         elif word in ['rollup', 'rollup-']:
             if not _try_auth_verified():
                 continue
-            state.rollup = word == 'rollup'
-
-            state.save()
+            action.rollup(state, word)
 
         elif word == 'force' and realtime:
             if not _try_auth_verified():
                 continue
-            if 'buildbot' in repo_cfg:
-                with buildbot_sess(repo_cfg) as sess:
-                    res = sess.post(
-                        repo_cfg['buildbot']['url'] + '/builders/_selected/stopselected',   # noqa
-                        allow_redirects=False,
-                        data={
-                            'selected': repo_cfg['buildbot']['builders'],
-                            'comments': INTERRUPTED_BY_HOMU_FMT.format(int(time.time())),  # noqa
-                    })
-
-            if 'authzfail' in res.text:
-                err = 'Authorization failed'
-            else:
-                mat = re.search('(?s)<div class="error">(.*?)</div>', res.text)
-                if mat:
-                    err = mat.group(1).strip()
-                    if not err:
-                        err = 'Unknown error'
-                else:
-                    err = ''
-
-            if err:
-                state.add_comment(
-                    ':bomb: Buildbot returned an error: `{}`'.format(err)
-                )
+            force(repo_cfg, state)
 
         elif word == 'clean' and realtime:
             if not _try_auth_verified():
                 continue
-            state.merge_sha = ''
-            state.init_build_res([])
+            action.clean(state)
 
-            state.save()
         elif (word == 'hello?' or word == 'ping') and realtime:
-            state.add_comment(":sleepy: I'm awake I'm awake")
+            action.hello_or_ping(state)
+
         elif word.startswith('treeclosed='):
             if not _reviewer_auth_verified():
                 continue
-            try:
-                treeclosed = int(word[len('treeclosed='):])
-                state.change_treeclosed(treeclosed)
-            except ValueError:
-                pass
-            state.save()
+            action.set_treeclosed(state, word.lstrip("treeclosed="))
+
         elif word == 'treeclosed-':
             if not _reviewer_auth_verified():
                 continue
-            state.change_treeclosed(-1)
-            state.save()
-        elif 'hooks' in global_cfg:
+            action.treeclosed_negative(state)
+
+        elif 'hooks' in cfg:
+            # TODO: Can't extract this code to a new function
+            # because it changes the value of `found`.
             hook_found = False
-            for hook in global_cfg['hooks']:
-                hook_cfg = global_cfg['hooks'][hook]
+            for hook in cfg['hooks']:
+                hook_cfg = cfg['hooks'][hook]
                 if hook_cfg['realtime'] and not realtime:
                     continue
                 if word == hook or word.startswith('%s=' % hook):
@@ -671,10 +572,35 @@ def parse_commands(body, username, repo_cfg, state, my_username, db, states,
 
         if found:
             state_changed = True
-
             words[i] = ''
 
     return state_changed
+
+
+def force(repo_cfg, state):
+    if 'buildbot' in repo_cfg:
+        with buildbot_sess(repo_cfg) as sess:
+            res = sess.post(
+                repo_cfg['buildbot']['url'] + '/builders/_selected/stopselected',   # noqa
+                allow_redirects=False,
+                data={
+                    'selected': repo_cfg['buildbot']['builders'],
+                    'comments': INTERRUPTED_BY_HOMU_FMT.format(int(time.time())),  # noqa
+            })
+    if 'authzfail' in res.text:
+        err = 'Authorization failed'
+    else:
+        mat = re.search('(?s)<div class="error">(.*?)</div>', res.text)
+        if mat:
+            err = mat.group(1).strip()
+            if not err:
+                err = 'Unknown error'
+        else:
+            err = ''
+    if err:
+        state.add_comment(
+            ':bomb: Buildbot returned an error: `{}`'.format(err)
+        )
 
 
 def handle_hook_response(state, hook_cfg, body, extra_data):
@@ -745,10 +671,15 @@ def branch_equal_to_merge(git_cmd, state, branch):
     return utils.silent_call(git_cmd('diff', '--quiet', 'FETCH_HEAD', branch)) == 0  # noqa
 
 
-def create_merge(state, repo_cfg, branch, git_cfg, ensure_merge_equal=False):
+def create_merge(state, repo_cfg, branch, logger, git_cfg,
+                 ensure_merge_equal=False):
     base_sha = state.get_repo().ref('heads/' + state.base_ref).object.sha
 
     state.refresh()
+
+    lazy_debug(logger,
+               lambda: "create_merge: attempting merge {} into {} on {!r}"
+               .format(state.head_sha, branch, state.get_repo()))
 
     merge_msg = 'Auto merge of #{} - {}, r={}\n\n{}\n\n{}'.format(
         state.num,
@@ -890,6 +821,7 @@ def create_merge(state, repo_cfg, branch, git_cfg, ensure_merge_equal=False):
         context='homu')
 
     state.add_comment(':lock: ' + desc)
+    state.change_labels(action.LabelEvent.CONFLICT)
 
     return ''
 
@@ -920,13 +852,15 @@ def get_github_merge_sha(state, repo_cfg, git_cfg):
     return subprocess.check_output(git_cmd('rev-parse', 'FETCH_HEAD')).decode('ascii').strip()  # noqa
 
 
-def do_exemption_merge(state, repo_cfg, git_cfg, url, check_merge, reason):
+def do_exemption_merge(state, logger, repo_cfg, git_cfg, url, check_merge,
+                       reason):
 
     try:
         merge_sha = create_merge(
             state,
             repo_cfg,
             state.base_ref,
+            logger,
             git_cfg,
             check_merge)
     except subprocess.CalledProcessError:
@@ -943,6 +877,7 @@ def do_exemption_merge(state, repo_cfg, git_cfg, url, check_merge, reason):
     utils.github_create_status(state.get_repo(), state.head_sha, 'success',
                                url, desc, context='homu')
     state.add_comment(':zap: {}: {}.'.format(desc, reason))
+    state.change_labels(action.LabelEvent.EXEMPTED)
 
     state.merge_sha = merge_sha
     state.save()
@@ -951,7 +886,7 @@ def do_exemption_merge(state, repo_cfg, git_cfg, url, check_merge, reason):
     return True
 
 
-def try_travis_exemption(state, repo_cfg, git_cfg):
+def try_travis_exemption(state, logger, repo_cfg, git_cfg):
 
     travis_info = None
     for info in utils.github_iter_statuses(state.get_repo(), state.head_sha):
@@ -986,14 +921,14 @@ def try_travis_exemption(state, repo_cfg, git_cfg):
     if (travis_commit.parents[0]['sha'] == base_sha and
             travis_commit.parents[1]['sha'] == state.head_sha):
         # make sure we check against the github merge sha before pushing
-        return do_exemption_merge(state, repo_cfg, git_cfg,
+        return do_exemption_merge(state, logger, repo_cfg, git_cfg,
                                   travis_info.target_url, True,
                                   "merge already tested by Travis CI")
 
     return False
 
 
-def try_status_exemption(state, repo_cfg, git_cfg):
+def try_status_exemption(state, logger, repo_cfg, git_cfg):
 
     # If all the builders are status-based, then we can do some checks to
     # exempt testing under the following cases:
@@ -1032,7 +967,7 @@ def try_status_exemption(state, repo_cfg, git_cfg):
     # is the PR fully rebased?
     base_sha = state.get_repo().ref('heads/' + state.base_ref).object.sha
     if pull_is_rebased(state, repo_cfg, git_cfg, base_sha):
-        return do_exemption_merge(state, repo_cfg, git_cfg, '', False,
+        return do_exemption_merge(state, logger, repo_cfg, git_cfg, '', False,
                                   "pull fully rebased and already tested")
 
     # check if we can use the github merge sha as proof
@@ -1050,7 +985,7 @@ def try_status_exemption(state, repo_cfg, git_cfg):
             merge_commit.parents[0]['sha'] == base_sha and
             merge_commit.parents[1]['sha'] == state.head_sha):
         # make sure we check against the github merge sha before pushing
-        return do_exemption_merge(state, repo_cfg, git_cfg, '', True,
+        return do_exemption_merge(state, logger, repo_cfg, git_cfg, '', True,
                                   "merge already tested")
 
     return False
@@ -1060,19 +995,31 @@ def start_build(state, repo_cfgs, buildbot_slots, logger, db, git_cfg):
     if buildbot_slots[0]:
         return True
 
+    lazy_debug(logger, lambda: "start_build on {!r}".format(state.get_repo()))
+
     assert state.head_sha == state.get_repo().pull_request(state.num).head.sha
 
     repo_cfg = repo_cfgs[state.repo_label]
 
     builders = []
-    branch = 'try' if state.try_ else 'auto'
+    branch = 'auto'
+    if state.try_:
+        if state.try_choose:
+            branch = "try-%s" % state.try_choose
+        else:
+            branch = "try"
     branch = repo_cfg.get('branch', {}).get(branch, branch)
     can_try_travis_exemption = False
 
     only_status_builders = True
     if 'buildbot' in repo_cfg:
         if state.try_:
-            builders += repo_cfg['buildbot']['try_builders']
+            if state.try_choose:
+                builders = (
+                    repo_cfg['buildbot']['try_choosers'][state.try_choose]
+                )
+            else:
+                builders += repo_cfg['buildbot']['try_builders']
         else:
             builders += repo_cfg['buildbot']['builders']
         only_status_builders = False
@@ -1096,19 +1043,25 @@ def start_build(state, repo_cfgs, buildbot_slots, logger, db, git_cfg):
 
         if found_travis_context and len(builders) == 1:
             can_try_travis_exemption = True
+    if 'checks' in repo_cfg:
+        builders += ['checks-' + key for key, value in repo_cfg['checks'].items() if 'name' in value]  # noqa
+        only_status_builders = False
 
-    if len(builders) is 0:
+    if len(builders) == 0:
         raise RuntimeError('Invalid configuration')
+
+    lazy_debug(logger, lambda: "start_build: builders={!r}".format(builders))
 
     if (only_status_builders and state.approved_by and
             repo_cfg.get('status_based_exemption', False)):
         if can_try_travis_exemption:
-            if try_travis_exemption(state, repo_cfg, git_cfg):
+            if try_travis_exemption(state, logger, repo_cfg, git_cfg):
                 return True
-        if try_status_exemption(state, repo_cfg, git_cfg):
+        if try_status_exemption(state, logger, repo_cfg, git_cfg):
             return True
 
-    merge_sha = create_merge(state, repo_cfg, branch, git_cfg)
+    merge_sha = create_merge(state, repo_cfg, branch, logger, git_cfg)
+    lazy_debug(logger, lambda: "start_build: merge_sha={}".format(merge_sha))
     if not merge_sha:
         return False
 
@@ -1127,8 +1080,8 @@ def start_build(state, repo_cfgs, buildbot_slots, logger, db, git_cfg):
         branch,
         state.merge_sha))
 
-    state.test_started = time.time()
-    state.set_status('pending')
+    timeout = repo_cfg.get('timeout', DEFAULT_TEST_TIMEOUT)
+    state.start_testing(timeout)
 
     desc = '{} commit {} with merge {}...'.format(
         'Trying' if state.try_ else 'Testing',
@@ -1204,8 +1157,8 @@ def start_rebuild(state, repo_cfgs):
                 state.add_comment(':bomb: Failed to start rebuilding: `{}`'.format(err))  # noqa
                 return False
 
-    state.test_started = time.time()
-    state.set_status('pending')
+    timeout = repo_cfg.get('timeout', DEFAULT_TEST_TIMEOUT)
+    state.start_testing(timeout)
 
     msg_1 = 'Previous build results'
     msg_2 = ' for {}'.format(', '.join('[{}]({})'.format(builder, url) for builder, url in succ_builders))  # noqa
@@ -1238,6 +1191,8 @@ def process_queue(states, repos, repo_cfgs, logger, buildbot_slots, db,
         repo_states = sorted(states[repo_label].values())
 
         for state in repo_states:
+            lazy_debug(logger, lambda: "process_queue: state={!r}, building {}"
+                       .format(state, repo_label))
             if state.priority < repo.treeclosed:
                 continue
             if state.status == 'pending' and not state.try_:
@@ -1300,10 +1255,11 @@ def fetch_mergeability(mergeable_que):
                 state.add_comment(':umbrella: The latest upstream changes{} made this pull request unmergeable. Please resolve the merge conflicts.'.format(  # noqa
                     _blame
                 ))
+                state.change_labels(action.LabelEvent.CONFLICT)
 
             state.set_mergeable(mergeable, que=False)
 
-        except:
+        except Exception:
             print('* Error while fetching mergeability')
             traceback.print_exc()
 
@@ -1311,40 +1267,7 @@ def fetch_mergeability(mergeable_que):
             mergeable_que.task_done()
 
 
-def check_timeout(states, queue_handler):
-    while True:
-        try:
-            for repo_label, repo_states in states.items():
-                for num, state in repo_states.items():
-                    _timout = time.time() - state.test_started >= TEST_TIMEOUT
-                    if state.status == 'pending' and _timout:
-                        print('* Test timed out: {}'.format(state))
-
-                        state.merge_sha = ''
-                        state.save()
-                        state.set_status('failure')
-
-                        desc = 'Test timed out'
-                        utils.github_create_status(
-                            state.get_repo(),
-                            state.head_sha,
-                            'failure',
-                            '',
-                            desc,
-                            context='homu')
-                        state.add_comment(':boom: {}'.format(desc))
-
-                        queue_handler()
-
-        except:
-            print('* Error while checking timeout')
-            traceback.print_exc()
-
-        finally:
-            time.sleep(3600)
-
-
-def synchronize(repo_label, repo_cfg, logger, gh, states, repos, db, mergeable_que, my_username, repo_labels):  # noqa
+def synchronize(repo_label, cfg, repo_cfg, logger, gh, states, repos, db, mergeable_que, my_username, repo_labels):  # noqa
     logger.info('Synchronizing {}...'.format(repo_label))
 
     repo = gh.repository(repo_cfg['owner'], repo_cfg['name'])
@@ -1378,7 +1301,7 @@ def synchronize(repo_label, repo_cfg, logger, gh, states, repos, db, mergeable_q
                     status = info.state
                     break
 
-        state = PullReqState(pull.number, pull.head.sha, status, db, repo_label, mergeable_que, gh, repo_cfg['owner'], repo_cfg['name'], repos)  # noqa
+        state = PullReqState(pull.number, pull.head.sha, status, db, repo_label, mergeable_que, gh, repo_cfg['owner'], repo_cfg['name'], repo_cfg.get('labels', {}), repos)  # noqa
         state.title = pull.title
         state.body = pull.body
         state.head_ref = pull.head.repo[0] + ':' + pull.head.ref
@@ -1389,6 +1312,7 @@ def synchronize(repo_label, repo_cfg, logger, gh, states, repos, db, mergeable_q
         for comment in pull.iter_comments():
             if comment.original_commit_id == pull.head.sha:
                 parse_commands(
+                    cfg,
                     comment.body,
                     comment.user.login,
                     repo_cfg,
@@ -1401,6 +1325,7 @@ def synchronize(repo_label, repo_cfg, logger, gh, states, repos, db, mergeable_q
 
         for comment in pull.iter_issue_comments():
             parse_commands(
+                cfg,
                 comment.body,
                 comment.user.login,
                 repo_cfg,
@@ -1442,7 +1367,6 @@ def arguments():
 
 
 def main():
-    global global_cfg
     args = arguments()
 
     logger = logging.getLogger('homu')
@@ -1462,7 +1386,6 @@ def main():
                 cfg = json.loads(fp.read())
         else:
             raise
-    global_cfg = cfg
 
     gh = github3.login(token=cfg['github']['access_token'])
     user = gh.user()
@@ -1509,6 +1432,7 @@ def main():
         approved_by TEXT,
         priority INTEGER,
         try_ INTEGER,
+        try_choose TEXT,
         rollup INTEGER,
         delegate TEXT,
         UNIQUE (repo, num)
@@ -1544,10 +1468,10 @@ def main():
 
         db_query(
             db,
-            'SELECT num, head_sha, status, title, body, head_ref, base_ref, assignee, approved_by, priority, try_, rollup, delegate, merge_sha FROM pull WHERE repo = ?',   # noqa
+            'SELECT num, head_sha, status, title, body, head_ref, base_ref, assignee, approved_by, priority, try_, try_choose, rollup, delegate, merge_sha FROM pull WHERE repo = ?',   # noqa
             [repo_label])
-        for num, head_sha, status, title, body, head_ref, base_ref, assignee, approved_by, priority, try_, rollup, delegate, merge_sha in db.fetchall():  # noqa
-            state = PullReqState(num, head_sha, status, db, repo_label, mergeable_que, gh, repo_cfg['owner'], repo_cfg['name'], repos)  # noqa
+        for num, head_sha, status, title, body, head_ref, base_ref, assignee, approved_by, priority, try_, try_choose, rollup, delegate, merge_sha in db.fetchall():  # noqa
+            state = PullReqState(num, head_sha, status, db, repo_label, mergeable_que, gh, repo_cfg['owner'], repo_cfg['name'], repo_cfg.get('labels', {}), repos)  # noqa
             state.title = title
             state.body = body
             state.head_ref = head_ref
@@ -1557,6 +1481,7 @@ def main():
             state.approved_by = approved_by
             state.priority = int(priority)
             state.try_ = bool(try_)
+            state.try_choose = try_choose
             state.rollup = bool(rollup)
             state.delegate = delegate
             builders = []
@@ -1567,7 +1492,9 @@ def main():
                     builders += ['travis']
                 if 'status' in repo_cfg:
                     builders += ['status-' + key for key, value in repo_cfg['status'].items() if 'context' in value]  # noqa
-                if len(builders) is 0:
+                if 'checks' in repo_cfg:
+                    builders += ['checks-' + key for key, value in repo_cfg['checks'].items() if 'name' in value]  # noqa
+                if len(builders) == 0:
                     raise RuntimeError('Invalid configuration')
 
                 state.init_build_res(builders, use_db=False)
@@ -1651,7 +1578,6 @@ def main():
         ]).start()
 
     Thread(target=fetch_mergeability, args=[mergeable_que]).start()
-    Thread(target=check_timeout, args=[states, queue_handler]).start()
 
     queue_handler()
 
