@@ -1337,6 +1337,11 @@ def synchronize(repo_label, cfg, repo_cfg, logger, gh, states, repos, db, mergea
                 states,
             )
 
+        for review in pull.reviews():
+            if review.state == "APPROVED" and review.commit_id == pull.head.sha:
+                action.review_approved(state, False, review.user.login, review.user.login,
+                        my_username, pull.head.sha, states)
+
         saved_state = saved_states.get(pull.number)
         if saved_state:
             for key, val in saved_state.items():
