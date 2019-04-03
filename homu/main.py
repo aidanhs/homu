@@ -194,7 +194,7 @@ class PullReqState:
             return
 
         issue = self.get_issue()
-        labels = {label.name for label in issue.iter_labels()}
+        labels = {label.name for label in issue.labels()}
         if labels.isdisjoint(unless):
             labels.difference_update(removes)
             labels.update(adds)
@@ -367,8 +367,7 @@ class PullReqState:
         self.set_status('failure')
 
         desc = 'Test timed out'
-        utils.github_create_status(
-            self.get_repo(),
+        self.get_repo().create_status(
             self.head_sha,
             'failure',
             '',
@@ -631,8 +630,7 @@ def git_push(git_cmd, branch, state):
         utils.logged_call(git_cmd('push', '-f', 'origin', 'homu-tmp'))
 
         def inner():
-            utils.github_create_status(
-                state.get_repo(),
+            state.get_repo().create_status(
                 merge_sha,
                 'success',
                 '',
@@ -810,15 +808,14 @@ def create_merge(state, repo_cfg, branch, logger, git_cfg,
                 branch,
                 state.head_sha,
                 merge_msg)
-        except github3.models.GitHubError as e:
+        except github3.exceptions.GitHubError as e:
             if e.code != 409:
                 raise
         else:
             return merge_commit.sha if merge_commit else ''
 
     state.set_status('error')
-    utils.github_create_status(
-        state.get_repo(),
+    state.get_repo().create_status(
         state.head_sha,
         'error',
         '',
@@ -879,8 +876,8 @@ def do_exemption_merge(state, logger, repo_cfg, git_cfg, url, check_merge,
     desc = 'Test exempted'
 
     state.set_status('success')
-    utils.github_create_status(state.get_repo(), state.head_sha, 'success',
-                               url, desc, context='homu')
+    state.get_repo().create_status(state.head_sha, 'success',
+                                   url, desc, context='homu')
     state.add_comment(':zap: {}: {}.'.format(desc, reason))
     state.change_labels(action.LabelEvent.EXEMPTED)
 
@@ -894,7 +891,7 @@ def do_exemption_merge(state, logger, repo_cfg, git_cfg, url, check_merge,
 def try_travis_exemption(state, logger, repo_cfg, git_cfg):
 
     travis_info = None
-    for info in utils.github_iter_statuses(state.get_repo(), state.head_sha):
+    for info in state.get_repo().statuses(state.head_sha):
         if info.context == 'continuous-integration/travis-ci/pr':
             travis_info = info
             break
@@ -962,7 +959,7 @@ def try_status_exemption(state, logger, repo_cfg, git_cfg):
 
     # let's first check that all the statuses we want are set to success
     statuses_pass = set()
-    for info in utils.github_iter_statuses(state.get_repo(), state.head_sha):
+    for info in state.get_repo().statuses(state.head_sha):
         if info.context in status_equivalences and info.state == 'success':
             statuses_pass.add(status_equivalences[info.context])
 
@@ -981,7 +978,7 @@ def try_status_exemption(state, logger, repo_cfg, git_cfg):
         return False
 
     statuses_merge_pass = set()
-    for info in utils.github_iter_statuses(state.get_repo(), merge_sha):
+    for info in state.get_repo().statuses(merge_sha):
         if info.context in status_equivalences and info.state == 'success':
             statuses_merge_pass.add(status_equivalences[info.context])
 
@@ -1093,8 +1090,7 @@ def start_build(state, repo_cfgs, buildbot_slots, logger, db, git_cfg):
         state.head_sha,
         state.merge_sha,
     )
-    utils.github_create_status(
-        state.get_repo(),
+    state.get_repo().create_status(
         state.head_sha,
         'pending',
         '',
@@ -1170,8 +1166,7 @@ def start_rebuild(state, repo_cfgs):
     msg_3 = ' are reusable. Rebuilding'
     msg_4 = ' only {}'.format(', '.join('[{}]({})'.format(builder, url) for builder, url in builders))  # noqa
 
-    utils.github_create_status(
-        state.get_repo(),
+    state.get_repo().create_status(
         state.head_sha,
         'pending',
         '',
@@ -1292,7 +1287,7 @@ def synchronize(repo_label, cfg, repo_cfg, logger, gh, states, repos, db, mergea
     states[repo_label] = {}
     repos[repo_label] = Repository(repo, repo_label, db)
 
-    for pull in repo.iter_pulls(state='open'):
+    for pull in repo.pull_requests(state='open'):
         db_query(
             db,
             'SELECT status FROM pull WHERE repo = ? AND num = ?',
@@ -1302,7 +1297,7 @@ def synchronize(repo_label, cfg, repo_cfg, logger, gh, states, repos, db, mergea
             status = row[0]
         else:
             status = ''
-            for info in utils.github_iter_statuses(repo, pull.head.sha):
+            for info in repo.statuses(pull.head.sha):
                 if info.context == 'homu':
                     status = info.state
                     break
@@ -1315,7 +1310,8 @@ def synchronize(repo_label, cfg, repo_cfg, logger, gh, states, repos, db, mergea
         state.set_mergeable(None)
         state.assignee = pull.assignee.login if pull.assignee else ''
 
-        for comment in pull.iter_comments():
+
+        for comment in pull.review_comments():
             if comment.original_commit_id == pull.head.sha:
                 parse_commands(
                     cfg,
@@ -1329,7 +1325,7 @@ def synchronize(repo_label, cfg, repo_cfg, logger, gh, states, repos, db, mergea
                     sha=comment.original_commit_id,
                 )
 
-        for comment in pull.iter_issue_comments():
+        for comment in pull.issue_comments():
             parse_commands(
                 cfg,
                 comment.body,
@@ -1394,12 +1390,12 @@ def main():
             raise
 
     gh = github3.login(token=cfg['github']['access_token'])
-    user = gh.user()
+    user = gh.me()
     cfg_git = cfg.get('git', {})
     user_email = cfg_git.get('email')
     if user_email is None:
         try:
-            user_email = [x for x in gh.iter_emails() if x['primary']][0]['email']  # noqa
+            user_email = [ x for x in gh.emails() if x.primary ][0].email  # noqa
         except IndexError:
             raise RuntimeError('Primary email not set, or "user" scope not granted')  # noqa
     user_name = cfg_git.get('name', user.name if user.name else user.login)
