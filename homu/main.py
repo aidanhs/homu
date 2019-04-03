@@ -140,7 +140,7 @@ class PullReqState:
 
     def head_advanced(self, head_sha, *, use_db=True):
         self.head_sha = head_sha
-        self.approved_by = ''
+        self.approved_by = []
         self.status = ''
         self.merge_sha = ''
         self.build_res = {}
@@ -298,7 +298,7 @@ class PullReqState:
     def save(self):
         db_query(
             self.db,
-            'INSERT OR REPLACE INTO pull (repo, num, status, merge_sha, title, body, head_sha, head_ref, base_ref, assignee, approved_by, priority, try_, try_choose, rollup, delegate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',  # noqa
+            'INSERT OR REPLACE INTO pull (repo, num, status, merge_sha, title, body, head_sha, head_ref, base_ref, assignee, priority, try_, try_choose, rollup, delegate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',  # noqa
             [
                 self.repo_label,
                 self.num,
@@ -310,13 +310,18 @@ class PullReqState:
                 self.head_ref,
                 self.base_ref,
                 self.assignee,
-                self.approved_by,
                 self.priority,
                 self.try_,
                 self.try_choose,
                 self.rollup,
                 self.delegate,
             ])
+        for approver in self.approved_by:
+            db_query(
+                self.db,
+                'INSERT OR IGNORE INTO approval (repo, num, approver) VALUES (?, ?, ?)',
+                [ self.repo_label, self.num, approver ]
+            )
 
     def refresh(self):
         issue = self.get_repo().issue(self.num)
@@ -470,7 +475,7 @@ def parse_commands(cfg, body, username, repo_cfg, state, my_username, db,
         elif word == 'r-':
             if not _reviewer_auth_verified():
                 continue
-            action.review_rejected(state, realtime)
+            action.review_rejected(state, username, realtime)
 
         elif word.startswith('p='):
             if not _try_auth_verified():
@@ -684,7 +689,7 @@ def create_merge(state, repo_cfg, branch, logger, git_cfg,
     merge_msg = 'Auto merge of #{} - {}, r={}\n\n{}\n\n{}'.format(
         state.num,
         state.head_ref,
-        '<try>' if state.try_ else state.approved_by,
+        '<try>' if state.try_ else "+".join(state.approved_by),
         state.title,
         state.body)
 
@@ -1275,6 +1280,7 @@ def synchronize(repo_label, cfg, repo_cfg, logger, gh, states, repos, db, mergea
     db_query(db, 'DELETE FROM pull WHERE repo = ?', [repo_label])
     db_query(db, 'DELETE FROM build_res WHERE repo = ?', [repo_label])
     db_query(db, 'DELETE FROM mergeable WHERE repo = ?', [repo_label])
+    db_query(db, 'DELETE FROM approval WHERE repo = ?', [repo_label])
 
     saved_states = {}
     for num, state in states[repo_label].items():
@@ -1429,13 +1435,19 @@ def main():
         head_ref TEXT,
         base_ref TEXT,
         assignee TEXT,
-        approved_by TEXT,
         priority INTEGER,
         try_ INTEGER,
         try_choose TEXT,
         rollup INTEGER,
         delegate TEXT,
         UNIQUE (repo, num)
+    )''')
+
+    db_query(db, '''CREATE TABLE IF NOT EXISTS approval (
+        repo TEXT NOT NULL,
+        num INTEGER NOT NULL,
+        approver TEXT NOT NULL,
+        UNIQUE (repo, num, approver)
     )''')
 
     db_query(db, '''CREATE TABLE IF NOT EXISTS build_res (
@@ -1468,9 +1480,9 @@ def main():
 
         db_query(
             db,
-            'SELECT num, head_sha, status, title, body, head_ref, base_ref, assignee, approved_by, priority, try_, try_choose, rollup, delegate, merge_sha FROM pull WHERE repo = ?',   # noqa
+            'SELECT num, head_sha, status, title, body, head_ref, base_ref, assignee, priority, try_, try_choose, rollup, delegate, merge_sha FROM pull WHERE repo = ?',   # noqa
             [repo_label])
-        for num, head_sha, status, title, body, head_ref, base_ref, assignee, approved_by, priority, try_, try_choose, rollup, delegate, merge_sha in db.fetchall():  # noqa
+        for num, head_sha, status, title, body, head_ref, base_ref, assignee, priority, try_, try_choose, rollup, delegate, merge_sha in db.fetchall():  # noqa
             state = PullReqState(num, head_sha, status, db, repo_label, mergeable_que, gh, repo_cfg['owner'], repo_cfg['name'], repo_cfg.get('labels', {}), repos)  # noqa
             state.title = title
             state.body = body
@@ -1478,7 +1490,9 @@ def main():
             state.base_ref = base_ref
             state.assignee = assignee
 
-            state.approved_by = approved_by
+            db_query(db, 'SELECT approver FROM approval WHERE repo = ? AND num = ?', [repo_label, num])
+            state.approved_by = [ x for (x, ) in db.fetchall() ]
+
             state.priority = int(priority)
             state.try_ = bool(try_)
             state.try_choose = try_choose
