@@ -584,6 +584,7 @@ def report_build_res(succ, url, builder, state, logger, repo_cfg):
 
     state.set_build_res(builder, succ, url)
 
+    min_approval = repo_cfg.get('min_approval_required', 1)
     if succ:
         if all(x['res'] for x in state.build_res.values()):
             state.set_status('success')
@@ -594,7 +595,7 @@ def report_build_res(succ, url, builder, state, logger, repo_cfg):
             urls = ', '.join('[{}]({})'.format(builder, x['url']) for builder, x in sorted(state.build_res.items()))  # noqa
             test_comment = ':sunny: {} - {}'.format(desc, urls)
 
-            if state.approved_by and not state.try_:
+            if state.approved_by and len(state.approved_by) >= min_approval and not state.try_:
                 comment = (test_comment + '\n' +
                            'Approved by: {}\nPushing {} to {}...'
                            ).format(state.approved_by, state.merge_sha,
