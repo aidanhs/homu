@@ -9,6 +9,7 @@ from .main import (
     synchronize,
 )
 from .action import LabelEvent
+from . import action
 from . import utils
 from .utils import lazy_debug
 import github3
@@ -321,41 +322,38 @@ def github():
     event_type = request.headers['X-Github-Event']
 
     if event_type == 'pull_request_review':
-        action = info['action']
         review_state = info['review']['state']
         commit_id = info['review']['commit_id']
         head_sha = info['pull_request']['head']['sha']
 
-        if action == 'submitted' and review_state == 'approved' and commit_id == head_sha: # noqa
+        if info['action'] == 'submitted' and review_state == 'approved' and commit_id == head_sha: # noqa
             pull_num = info['pull_request']['number']
-            body = "@{} r+".format(g.my_username)
             username = info['sender']['login']
-
             state = g.states[repo_label].get(pull_num)
+
             if state:
                 state.title = info['pull_request']['title']
                 state.body = info['pull_request']['body']
-
-                if parse_commands(
-                    body,
-                    username,
-                    repo_cfg,
-                    state,
-                    g.my_username,
-                    g.db,
-                    g.states,
-                    realtime=True,
-                    sha=commit_id,
-                ):
+                if action.review_approved(state, True, username, username,
+                                          g.my_username, commit_id, g.states):
                     state.save()
                     g.queue_handler()
+        elif info['action'] == 'dismissed' and review_state == 'approved' and commit_id == head_sha:
+            pull_num = info['pull_request']['number']
+            username = info['sender']['login']
+            state = g.states[repo_label].get(pull_num)
 
+            if state:
+                state.title = info['pull_request']['title']
+                state.body = info['pull_request']['body']
+                if action.review_rejected(state, username, True):
+                    state.save()
+                    g.queue_handler()
     elif event_type == 'pull_request_review_comment':
-        action = info['action']
         original_commit_id = info['comment']['original_commit_id']
         head_sha = info['pull_request']['head']['sha']
 
-        if action == 'created' and original_commit_id == head_sha:
+        if info['action'] == 'created' and original_commit_id == head_sha:
             pull_num = info['pull_request']['number']
             body = info['comment']['body']
             username = info['sender']['login']
@@ -382,17 +380,16 @@ def github():
                     g.queue_handler()
 
     elif event_type == 'pull_request':
-        action = info['action']
         pull_num = info['number']
         head_sha = info['pull_request']['head']['sha']
 
-        if action == 'synchronize':
+        if info['action'] == 'synchronize':
             state = g.states[repo_label][pull_num]
             state.head_advanced(head_sha)
 
             state.save()
 
-        elif action in ['opened', 'reopened']:
+        elif info['action'] in ['opened', 'reopened']:
             state = PullReqState(pull_num, head_sha, '', g.db, repo_label,
                                  g.mergeable_que, g.gh,
                                  info['repository']['owner']['login'],
@@ -409,7 +406,7 @@ def github():
 
             found = False
 
-            if action == 'reopened':
+            if info['action'] == 'reopened':
                 # FIXME: Review comments are ignored here
                 for c in state.get_repo().issue(pull_num).iter_comments():
                     found = parse_commands(
@@ -439,7 +436,7 @@ def github():
             if found:
                 g.queue_handler()
 
-        elif action == 'closed':
+        elif info['action'] == 'closed':
             state = g.states[repo_label][pull_num]
             if hasattr(state, 'fake_merge_sha'):
                 def inner():
@@ -469,15 +466,15 @@ def github():
 
             g.queue_handler()
 
-        elif action in ['assigned', 'unassigned']:
+        elif info['action'] in ['assigned', 'unassigned']:
             state = g.states[repo_label][pull_num]
             state.assignee = (info['pull_request']['assignee']['login'] if
                               info['pull_request']['assignee'] else '')
 
             state.save()
 
-        elif not action.startswith("review_"):
-            lazy_debug(logger, lambda: 'Invalid pull_request action: {}'.format(action))  # noqa
+        elif not info['action'].startswith("review_"):
+            lazy_debug(logger, lambda: 'Invalid pull_request action: {}'.format(info['action']))  # noqa
 
     elif event_type == 'push':
         ref = info['ref'][len('refs/heads/'):]
