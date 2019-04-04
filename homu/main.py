@@ -857,6 +857,11 @@ def get_github_merge_sha(state, repo_cfg, git_cfg):
 def do_exemption_merge(state, logger, repo_cfg, git_cfg, url, check_merge,
                        reason):
 
+    min_approval = repo_cfg.get('min_approval_required', 1)
+    assert state.approved_by
+    if len(state.approved_by) < min_approval:
+        return True
+
     try:
         merge_sha = create_merge(
             state,
@@ -1055,7 +1060,7 @@ def start_build(state, repo_cfgs, buildbot_slots, logger, db, git_cfg):
     lazy_debug(logger, lambda: "start_build: builders={!r}".format(builders))
 
     if (only_status_builders and state.approved_by and
-            repo_cfg.get('status_based_exemption', False)):
+        repo_cfg.get('status_based_exemption', False)):
         if can_try_travis_exemption:
             if try_travis_exemption(state, logger, repo_cfg, git_cfg):
                 return True
