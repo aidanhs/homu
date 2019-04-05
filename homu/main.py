@@ -965,6 +965,7 @@ def try_status_exemption(state, logger, repo_cfg, git_cfg):
     # let's first check that all the statuses we want are set to success
     statuses_pass = set()
     for info in state.get_repo().statuses(state.head_sha):
+        lazy_debug(logger, lambda: "exempt: info: {!r}".format(info))
         if info.context in status_equivalences and info.state == 'success':
             statuses_pass.add(status_equivalences[info.context])
 
@@ -977,9 +978,11 @@ def try_status_exemption(state, logger, repo_cfg, git_cfg):
         return do_exemption_merge(state, logger, repo_cfg, git_cfg, '', False,
                                   "pull fully rebased and already tested")
 
+    logger.info("pull is not fully rebased, {} {}", state.head_sha, base_sha)
     # check if we can use the github merge sha as proof
     merge_sha = get_github_merge_sha(state, repo_cfg, git_cfg)
     if merge_sha is None:
+        logger.info("No merge sha found")
         return False
 
     statuses_merge_pass = set()
@@ -995,6 +998,7 @@ def try_status_exemption(state, logger, repo_cfg, git_cfg):
         return do_exemption_merge(state, logger, repo_cfg, git_cfg, '', True,
                                   "merge already tested")
 
+    logger.info("merge commit didn't succeed")
     return False
 
 
