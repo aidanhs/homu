@@ -9,6 +9,7 @@ from .main import (
     synchronize,
 )
 from .action import LabelEvent
+from . import action
 from . import utils
 from .utils import lazy_debug
 import github3
@@ -266,7 +267,7 @@ def rollup(user_gh, state, repo_label, repo_cfg, repo):
         try:
             rollup = repo_cfg.get('branch', {}).get('rollup', 'rollup')
             user_repo.merge(rollup, state.head_sha, merge_msg)
-        except github3.models.GitHubError as e:
+        except github3.exceptions.GitHubError as e:
             if e.code != 409:
                 raise
 
@@ -288,7 +289,7 @@ def rollup(user_gh, state, repo_label, repo_cfg, repo):
             user_repo.owner.login + ':' + rollup,
             body,
         )
-    except github3.models.GitHubError as e:
+    except github3.exceptions.GitHubError as e:
         return e.response.text
     else:
         redirect(pull.html_url)
@@ -321,41 +322,38 @@ def github():
     event_type = request.headers['X-Github-Event']
 
     if event_type == 'pull_request_review':
-        action = info['action']
         review_state = info['review']['state']
         commit_id = info['review']['commit_id']
         head_sha = info['pull_request']['head']['sha']
 
-        if action == 'submitted' and review_state == 'approved' and commit_id == head_sha: # noqa
+        if info['action'] == 'submitted' and review_state == 'approved' and commit_id == head_sha: # noqa
             pull_num = info['pull_request']['number']
-            body = "@{} r+".format(g.my_username)
             username = info['sender']['login']
-
             state = g.states[repo_label].get(pull_num)
+
             if state:
                 state.title = info['pull_request']['title']
                 state.body = info['pull_request']['body']
-
-                if parse_commands(
-                    body,
-                    username,
-                    repo_cfg,
-                    state,
-                    g.my_username,
-                    g.db,
-                    g.states,
-                    realtime=True,
-                    sha=commit_id,
-                ):
+                if action.review_approved(state, True, username, username,
+                                          g.my_username, commit_id, g.states):
                     state.save()
                     g.queue_handler()
+        elif info['action'] == 'dismissed' and review_state == 'approved' and commit_id == head_sha:
+            pull_num = info['pull_request']['number']
+            username = info['sender']['login']
+            state = g.states[repo_label].get(pull_num)
 
+            if state:
+                state.title = info['pull_request']['title']
+                state.body = info['pull_request']['body']
+                if action.review_rejected(state, username, True):
+                    state.save()
+                    g.queue_handler()
     elif event_type == 'pull_request_review_comment':
-        action = info['action']
         original_commit_id = info['comment']['original_commit_id']
         head_sha = info['pull_request']['head']['sha']
 
-        if action == 'created' and original_commit_id == head_sha:
+        if info['action'] == 'created' and original_commit_id == head_sha:
             pull_num = info['pull_request']['number']
             body = info['comment']['body']
             username = info['sender']['login']
@@ -382,17 +380,16 @@ def github():
                     g.queue_handler()
 
     elif event_type == 'pull_request':
-        action = info['action']
         pull_num = info['number']
         head_sha = info['pull_request']['head']['sha']
 
-        if action == 'synchronize':
+        if info['action'] == 'synchronize':
             state = g.states[repo_label][pull_num]
             state.head_advanced(head_sha)
 
             state.save()
 
-        elif action in ['opened', 'reopened']:
+        elif info['action'] in ['opened', 'reopened']:
             state = PullReqState(pull_num, head_sha, '', g.db, repo_label,
                                  g.mergeable_que, g.gh,
                                  info['repository']['owner']['login'],
@@ -409,9 +406,9 @@ def github():
 
             found = False
 
-            if action == 'reopened':
+            if info['action'] == 'reopened':
                 # FIXME: Review comments are ignored here
-                for c in state.get_repo().issue(pull_num).iter_comments():
+                for c in state.get_repo().issue(pull_num).comments():
                     found = parse_commands(
                         g.cfg,
                         c.body,
@@ -424,8 +421,7 @@ def github():
                     ) or found
 
                 status = ''
-                for info in utils.github_iter_statuses(state.get_repo(),
-                                                       state.head_sha):
+                for info in state.get_repo().statuses(state.head_sha):
                     if info.context == 'homu':
                         status = info.state
                         break
@@ -439,7 +435,7 @@ def github():
             if found:
                 g.queue_handler()
 
-        elif action == 'closed':
+        elif info['action'] == 'closed':
             state = g.states[repo_label][pull_num]
             if hasattr(state, 'fake_merge_sha'):
                 def inner():
@@ -469,15 +465,15 @@ def github():
 
             g.queue_handler()
 
-        elif action in ['assigned', 'unassigned']:
+        elif info['action'] in ['assigned', 'unassigned']:
             state = g.states[repo_label][pull_num]
             state.assignee = (info['pull_request']['assignee']['login'] if
                               info['pull_request']['assignee'] else '')
 
             state.save()
 
-        elif not action.startswith("review_"):
-            lazy_debug(logger, lambda: 'Invalid pull_request action: {}'.format(action))  # noqa
+        elif not info['action'].startswith("review_"):
+            lazy_debug(logger, lambda: 'Invalid pull_request action: {}'.format(info['action']))  # noqa
 
     elif event_type == 'push':
         ref = info['ref'][len('refs/heads/'):]
@@ -584,17 +580,18 @@ def report_build_res(succ, url, builder, state, logger, repo_cfg):
 
     state.set_build_res(builder, succ, url)
 
+    min_approval = repo_cfg.get('min_approval_required', 1)
     if succ:
         if all(x['res'] for x in state.build_res.values()):
             state.set_status('success')
             desc = 'Test successful'
-            utils.github_create_status(state.get_repo(), state.head_sha,
-                                       'success', url, desc, context='homu')
+            state.get_repo().create_status(state.head_sha,
+                                           'success', url, desc, context='homu')
 
             urls = ', '.join('[{}]({})'.format(builder, x['url']) for builder, x in sorted(state.build_res.items()))  # noqa
             test_comment = ':sunny: {} - {}'.format(desc, urls)
 
-            if state.approved_by and not state.try_:
+            if state.approved_by and len(state.approved_by) >= min_approval and not state.try_:
                 comment = (test_comment + '\n' +
                            'Approved by: {}\nPushing {} to {}...'
                            ).format(state.approved_by, state.merge_sha,
@@ -605,9 +602,8 @@ def report_build_res(succ, url, builder, state, logger, repo_cfg):
                     try:
                         utils.github_set_ref(state.get_repo(), 'heads/' +
                                              state.base_ref, state.merge_sha)
-                    except github3.models.GitHubError:
-                        utils.github_create_status(
-                            state.get_repo(),
+                    except github3.exceptions.GitHubError:
+                        state.get_repo().create_status(
                             state.merge_sha,
                             'success', '',
                             'Branch protection bypassed',
@@ -617,13 +613,12 @@ def report_build_res(succ, url, builder, state, logger, repo_cfg):
 
                     state.fake_merge(repo_cfg)
 
-                except github3.models.GitHubError as e:
+                except github3.exceptions.GitHubError as e:
                     state.set_status('error')
                     desc = ('Test was successful, but fast-forwarding failed:'
                             ' {}'.format(e))
-                    utils.github_create_status(state.get_repo(),
-                                               state.head_sha, 'error', url,
-                                               desc, context='homu')
+                    state.get_repo().create_status(state.head_sha, 'error', url,
+                                                   desc, context='homu')
 
                     state.add_comment(':eyes: ' + desc)
             else:
@@ -637,8 +632,8 @@ def report_build_res(succ, url, builder, state, logger, repo_cfg):
         if state.status == 'pending':
             state.set_status('failure')
             desc = 'Test failed'
-            utils.github_create_status(state.get_repo(), state.head_sha,
-                                       'failure', url, desc, context='homu')
+            state.get_repo().create_status(state.head_sha,
+                                           'failure', url, desc, context='homu')
 
             state.add_comment(':broken_heart: {} - [{}]({})'.format(desc,
                                                                     builder,
@@ -732,11 +727,10 @@ def buildbot():
                                         'to prioritize another pull request.')
                                 state.add_comment(desc)
                                 state.change_labels(LabelEvent.INTERRUPTED)
-                                utils.github_create_status(state.get_repo(),
-                                                           state.head_sha,
-                                                           'error', url,
-                                                           desc,
-                                                           context='homu')
+                                state.get_repo().create_status(state.head_sha,
+                                                               'error', url,
+                                                               desc,
+                                                               context='homu')
 
                                 g.queue_handler()
 

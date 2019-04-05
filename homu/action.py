@@ -109,8 +109,8 @@ def delegate_negative(state):
     state.save()
 
 
-def review_rejected(state, realtime):
-    state.approved_by = ''
+def review_rejected(state, username, realtime):
+    state.approved_by = [ x for x in state.approved_by if x != username ]
     state.save()
     if realtime:
         state.change_labels(LabelEvent.REJECTED)
@@ -197,12 +197,14 @@ def review_approved(state, realtime, approver, username,
 
         if lines:
             lines.insert(0, '')
-        lines.insert(0, ':bulb: This pull request was already approved, no need to approve it again.')  # noqa
+        if approver in state.approved_by:
+            lines.insert(0, ':bulb: This pull request was already approved by {}, no need to approve it again.'.format(approver))  # noqa
 
         state.add_comment('\n'.join(lines))
 
     if sha_cmp(sha, state.head_sha):
-        state.approved_by = approver
+        if approver not in state.approved_by:
+            state.approved_by.append(approver)
         state.try_ = False
         state.try_choose = None
         state.set_status('')

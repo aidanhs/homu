@@ -207,7 +207,7 @@ class TestAction(unittest.TestCase):
         state.head_sha = 'abcd123'
         state.title = "My pull request"
         self.assertTrue(action.review_approved(state, True, 'user' ,'user', 'user', 'abcd123', []))
-        self.assertEqual(state.approved_by, 'user')
+        self.assertEqual(state.approved_by, ['user'])
         self.assertFalse(state.try_)
         state.set_status.assert_called_once_with('')
         state.save.assert_called_once_with()
@@ -222,7 +222,7 @@ class TestAction(unittest.TestCase):
         states = {}
         states[state.repo_label] = {'label': state}
         self.assertTrue(action.review_approved(state, True, 'user1' ,'user1', 'user2', 'abcd123', states))
-        self.assertEqual(state.approved_by, 'user1')
+        self.assertEqual(state.approved_by, ['user1'])
         self.assertFalse(state.try_)
         state.set_status.assert_called_once_with('')
         state.save.assert_called_once_with()
@@ -287,7 +287,7 @@ class TestAction(unittest.TestCase):
     def test_review_rejected(self, MockPullReqState):
         state = MockPullReqState()
         action.review_rejected(state, True)
-        self.assertEqual(state.approved_by, '')
+        self.assertEqual(state.approved_by, [])
         state.save.assert_called_once_with()
         state.change_labels.assert_called_once_with(LabelEvent.REJECTED)
 

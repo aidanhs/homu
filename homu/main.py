@@ -140,7 +140,7 @@ class PullReqState:
 
     def head_advanced(self, head_sha, *, use_db=True):
         self.head_sha = head_sha
-        self.approved_by = ''
+        self.approved_by = []
         self.status = ''
         self.merge_sha = ''
         self.build_res = {}
@@ -194,7 +194,7 @@ class PullReqState:
             return
 
         issue = self.get_issue()
-        labels = {label.name for label in issue.iter_labels()}
+        labels = {label.name for label in issue.labels()}
         if labels.isdisjoint(unless):
             labels.difference_update(removes)
             labels.update(adds)
@@ -298,7 +298,7 @@ class PullReqState:
     def save(self):
         db_query(
             self.db,
-            'INSERT OR REPLACE INTO pull (repo, num, status, merge_sha, title, body, head_sha, head_ref, base_ref, assignee, approved_by, priority, try_, try_choose, rollup, delegate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',  # noqa
+            'INSERT OR REPLACE INTO pull (repo, num, status, merge_sha, title, body, head_sha, head_ref, base_ref, assignee, priority, try_, try_choose, rollup, delegate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',  # noqa
             [
                 self.repo_label,
                 self.num,
@@ -310,13 +310,18 @@ class PullReqState:
                 self.head_ref,
                 self.base_ref,
                 self.assignee,
-                self.approved_by,
                 self.priority,
                 self.try_,
                 self.try_choose,
                 self.rollup,
                 self.delegate,
             ])
+        for approver in self.approved_by:
+            db_query(
+                self.db,
+                'INSERT OR IGNORE INTO approval (repo, num, approver) VALUES (?, ?, ?)',
+                [ self.repo_label, self.num, approver ]
+            )
 
     def refresh(self):
         issue = self.get_repo().issue(self.num)
@@ -362,8 +367,7 @@ class PullReqState:
         self.set_status('failure')
 
         desc = 'Test timed out'
-        utils.github_create_status(
-            self.get_repo(),
+        self.get_repo().create_status(
             self.head_sha,
             'failure',
             '',
@@ -470,7 +474,7 @@ def parse_commands(cfg, body, username, repo_cfg, state, my_username, db,
         elif word == 'r-':
             if not _reviewer_auth_verified():
                 continue
-            action.review_rejected(state, realtime)
+            action.review_rejected(state, username, realtime)
 
         elif word.startswith('p='):
             if not _try_auth_verified():
@@ -626,8 +630,7 @@ def git_push(git_cmd, branch, state):
         utils.logged_call(git_cmd('push', '-f', 'origin', 'homu-tmp'))
 
         def inner():
-            utils.github_create_status(
-                state.get_repo(),
+            state.get_repo().create_status(
                 merge_sha,
                 'success',
                 '',
@@ -684,7 +687,7 @@ def create_merge(state, repo_cfg, branch, logger, git_cfg,
     merge_msg = 'Auto merge of #{} - {}, r={}\n\n{}\n\n{}'.format(
         state.num,
         state.head_ref,
-        '<try>' if state.try_ else state.approved_by,
+        '<try>' if state.try_ else "+".join(state.approved_by),
         state.title,
         state.body)
 
@@ -805,15 +808,14 @@ def create_merge(state, repo_cfg, branch, logger, git_cfg,
                 branch,
                 state.head_sha,
                 merge_msg)
-        except github3.models.GitHubError as e:
+        except github3.exceptions.GitHubError as e:
             if e.code != 409:
                 raise
         else:
             return merge_commit.sha if merge_commit else ''
 
     state.set_status('error')
-    utils.github_create_status(
-        state.get_repo(),
+    state.get_repo().create_status(
         state.head_sha,
         'error',
         '',
@@ -855,6 +857,11 @@ def get_github_merge_sha(state, repo_cfg, git_cfg):
 def do_exemption_merge(state, logger, repo_cfg, git_cfg, url, check_merge,
                        reason):
 
+    min_approval = repo_cfg.get('min_approval_required', 1)
+    assert state.approved_by
+    if len(state.approved_by) < min_approval:
+        return True
+
     try:
         merge_sha = create_merge(
             state,
@@ -874,8 +881,8 @@ def do_exemption_merge(state, logger, repo_cfg, git_cfg, url, check_merge,
     desc = 'Test exempted'
 
     state.set_status('success')
-    utils.github_create_status(state.get_repo(), state.head_sha, 'success',
-                               url, desc, context='homu')
+    state.get_repo().create_status(state.head_sha, 'success',
+                                   url, desc, context='homu')
     state.add_comment(':zap: {}: {}.'.format(desc, reason))
     state.change_labels(action.LabelEvent.EXEMPTED)
 
@@ -889,7 +896,7 @@ def do_exemption_merge(state, logger, repo_cfg, git_cfg, url, check_merge,
 def try_travis_exemption(state, logger, repo_cfg, git_cfg):
 
     travis_info = None
-    for info in utils.github_iter_statuses(state.get_repo(), state.head_sha):
+    for info in state.get_repo().statuses(state.head_sha):
         if info.context == 'continuous-integration/travis-ci/pr':
             travis_info = info
             break
@@ -957,7 +964,7 @@ def try_status_exemption(state, logger, repo_cfg, git_cfg):
 
     # let's first check that all the statuses we want are set to success
     statuses_pass = set()
-    for info in utils.github_iter_statuses(state.get_repo(), state.head_sha):
+    for info in state.get_repo().statuses(state.head_sha):
         if info.context in status_equivalences and info.state == 'success':
             statuses_pass.add(status_equivalences[info.context])
 
@@ -976,7 +983,7 @@ def try_status_exemption(state, logger, repo_cfg, git_cfg):
         return False
 
     statuses_merge_pass = set()
-    for info in utils.github_iter_statuses(state.get_repo(), merge_sha):
+    for info in state.get_repo().statuses(merge_sha):
         if info.context in status_equivalences and info.state == 'success':
             statuses_merge_pass.add(status_equivalences[info.context])
 
@@ -1053,7 +1060,7 @@ def start_build(state, repo_cfgs, buildbot_slots, logger, db, git_cfg):
     lazy_debug(logger, lambda: "start_build: builders={!r}".format(builders))
 
     if (only_status_builders and state.approved_by and
-            repo_cfg.get('status_based_exemption', False)):
+        repo_cfg.get('status_based_exemption', False)):
         if can_try_travis_exemption:
             if try_travis_exemption(state, logger, repo_cfg, git_cfg):
                 return True
@@ -1088,8 +1095,7 @@ def start_build(state, repo_cfgs, buildbot_slots, logger, db, git_cfg):
         state.head_sha,
         state.merge_sha,
     )
-    utils.github_create_status(
-        state.get_repo(),
+    state.get_repo().create_status(
         state.head_sha,
         'pending',
         '',
@@ -1165,8 +1171,7 @@ def start_rebuild(state, repo_cfgs):
     msg_3 = ' are reusable. Rebuilding'
     msg_4 = ' only {}'.format(', '.join('[{}]({})'.format(builder, url) for builder, url in builders))  # noqa
 
-    utils.github_create_status(
-        state.get_repo(),
+    state.get_repo().create_status(
         state.head_sha,
         'pending',
         '',
@@ -1275,6 +1280,7 @@ def synchronize(repo_label, cfg, repo_cfg, logger, gh, states, repos, db, mergea
     db_query(db, 'DELETE FROM pull WHERE repo = ?', [repo_label])
     db_query(db, 'DELETE FROM build_res WHERE repo = ?', [repo_label])
     db_query(db, 'DELETE FROM mergeable WHERE repo = ?', [repo_label])
+    db_query(db, 'DELETE FROM approval WHERE repo = ?', [repo_label])
 
     saved_states = {}
     for num, state in states[repo_label].items():
@@ -1286,7 +1292,7 @@ def synchronize(repo_label, cfg, repo_cfg, logger, gh, states, repos, db, mergea
     states[repo_label] = {}
     repos[repo_label] = Repository(repo, repo_label, db)
 
-    for pull in repo.iter_pulls(state='open'):
+    for pull in repo.pull_requests(state='open'):
         db_query(
             db,
             'SELECT status FROM pull WHERE repo = ? AND num = ?',
@@ -1296,7 +1302,7 @@ def synchronize(repo_label, cfg, repo_cfg, logger, gh, states, repos, db, mergea
             status = row[0]
         else:
             status = ''
-            for info in utils.github_iter_statuses(repo, pull.head.sha):
+            for info in repo.statuses(pull.head.sha):
                 if info.context == 'homu':
                     status = info.state
                     break
@@ -1309,7 +1315,8 @@ def synchronize(repo_label, cfg, repo_cfg, logger, gh, states, repos, db, mergea
         state.set_mergeable(None)
         state.assignee = pull.assignee.login if pull.assignee else ''
 
-        for comment in pull.iter_comments():
+
+        for comment in pull.review_comments():
             if comment.original_commit_id == pull.head.sha:
                 parse_commands(
                     cfg,
@@ -1323,7 +1330,7 @@ def synchronize(repo_label, cfg, repo_cfg, logger, gh, states, repos, db, mergea
                     sha=comment.original_commit_id,
                 )
 
-        for comment in pull.iter_issue_comments():
+        for comment in pull.issue_comments():
             parse_commands(
                 cfg,
                 comment.body,
@@ -1334,6 +1341,11 @@ def synchronize(repo_label, cfg, repo_cfg, logger, gh, states, repos, db, mergea
                 db,
                 states,
             )
+
+        for review in pull.reviews():
+            if review.state == "APPROVED" and review.commit_id == pull.head.sha:
+                action.review_approved(state, False, review.user.login, review.user.login,
+                        my_username, pull.head.sha, states)
 
         saved_state = saved_states.get(pull.number)
         if saved_state:
@@ -1388,12 +1400,12 @@ def main():
             raise
 
     gh = github3.login(token=cfg['github']['access_token'])
-    user = gh.user()
+    user = gh.me()
     cfg_git = cfg.get('git', {})
     user_email = cfg_git.get('email')
     if user_email is None:
         try:
-            user_email = [x for x in gh.iter_emails() if x['primary']][0]['email']  # noqa
+            user_email = [ x for x in gh.emails() if x.primary ][0].email  # noqa
         except IndexError:
             raise RuntimeError('Primary email not set, or "user" scope not granted')  # noqa
     user_name = cfg_git.get('name', user.name if user.name else user.login)
@@ -1429,13 +1441,19 @@ def main():
         head_ref TEXT,
         base_ref TEXT,
         assignee TEXT,
-        approved_by TEXT,
         priority INTEGER,
         try_ INTEGER,
         try_choose TEXT,
         rollup INTEGER,
         delegate TEXT,
         UNIQUE (repo, num)
+    )''')
+
+    db_query(db, '''CREATE TABLE IF NOT EXISTS approval (
+        repo TEXT NOT NULL,
+        num INTEGER NOT NULL,
+        approver TEXT NOT NULL,
+        UNIQUE (repo, num, approver)
     )''')
 
     db_query(db, '''CREATE TABLE IF NOT EXISTS build_res (
@@ -1468,9 +1486,9 @@ def main():
 
         db_query(
             db,
-            'SELECT num, head_sha, status, title, body, head_ref, base_ref, assignee, approved_by, priority, try_, try_choose, rollup, delegate, merge_sha FROM pull WHERE repo = ?',   # noqa
+            'SELECT num, head_sha, status, title, body, head_ref, base_ref, assignee, priority, try_, try_choose, rollup, delegate, merge_sha FROM pull WHERE repo = ?',   # noqa
             [repo_label])
-        for num, head_sha, status, title, body, head_ref, base_ref, assignee, approved_by, priority, try_, try_choose, rollup, delegate, merge_sha in db.fetchall():  # noqa
+        for num, head_sha, status, title, body, head_ref, base_ref, assignee, priority, try_, try_choose, rollup, delegate, merge_sha in db.fetchall():  # noqa
             state = PullReqState(num, head_sha, status, db, repo_label, mergeable_que, gh, repo_cfg['owner'], repo_cfg['name'], repo_cfg.get('labels', {}), repos)  # noqa
             state.title = title
             state.body = body
@@ -1478,7 +1496,9 @@ def main():
             state.base_ref = base_ref
             state.assignee = assignee
 
-            state.approved_by = approved_by
+            db_query(db, 'SELECT approver FROM approval WHERE repo = ? AND num = ?', [repo_label, num])
+            state.approved_by = [ x for (x, ) in db.fetchall() ]
+
             state.priority = int(priority)
             state.try_ = bool(try_)
             state.try_choose = try_choose
