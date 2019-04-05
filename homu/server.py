@@ -778,7 +778,7 @@ def buildbot():
 
 
 def synch(user_gh, state, repo_label, repo_cfg, repo):
-    if not repo.is_collaborator(user_gh.user().login):
+    if not repo.is_collaborator(user_gh.me().login):
         abort(400, 'You are not a collaborator')
 
     Thread(target=synchronize, args=[repo_label, g.cfg, repo_cfg, g.logger,
