@@ -841,7 +841,8 @@ def pull_is_rebased(state, repo_cfg, git_cfg, base_sha, logger):
 # We could fetch this from GitHub instead, but that API is being deprecated:
 # https://developer.github.com/changes/2013-04-25-deprecating-merge-commit-sha/
 def get_github_merge_sha(state, repo_cfg, git_cfg):
-    assert git_cfg['local_git']
+    if not git_cfg['local_git']:
+        return None
     git_cmd = init_local_git_cmds(repo_cfg, git_cfg)
 
     if state.mergeable is not True:
@@ -976,7 +977,7 @@ def try_status_exemption(state, logger, repo_cfg, git_cfg):
         return do_exemption_merge(state, logger, repo_cfg, git_cfg, '', False,
                                   "pull fully rebased and already tested")
 
-    logger.info("pull is not fully rebased, {} {}", state.head_sha, base_sha)
+    logger.info("pull is not fully rebased, {} {}".format(state.head_sha, base_sha))
     # check if we can use the github merge sha as proof
     merge_sha = get_github_merge_sha(state, repo_cfg, git_cfg)
     if merge_sha is None:
