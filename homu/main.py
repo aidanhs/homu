@@ -845,7 +845,7 @@ def get_homu_merge_sha(state, repo_cfg, git_cfg):
     return None
 
 
-def do_exemption_merge(state, logger, repo_cfg, git_cfg, url, check_merge,
+def do_exemption_merge(state, logger, repo_cfg, git_cfg, url, merge_sha,
                        reason):
 
     min_approval = repo_cfg.get('min_approval_required', 1)
@@ -857,18 +857,42 @@ def do_exemption_merge(state, logger, repo_cfg, git_cfg, url, check_merge,
         state.add_comment(':zap: {}: {}.'.format(desc, reason))
         return True
 
-    try:
-        merge_sha = create_merge(
-            state,
-            repo_cfg,
-            state.base_ref,
-            logger,
-            git_cfg,
-            check_merge)
-    except subprocess.CalledProcessError:
-        print('* Unable to create a merge commit for the exempted PR: {}'.format(state))  # noqa
-        traceback.print_exc()
-        return False
+    if merge_sha is None:
+        # We haven't merged, create a merge now
+        try:
+            merge_sha = create_merge(
+                state,
+                repo_cfg,
+                state.base_ref,
+                logger,
+                git_cfg)
+        except subprocess.CalledProcessError:
+            print('* Unable to create a merge commit for the exempted PR: {}'.format(state))  # noqa
+            traceback.print_exc()
+            return False
+    else:
+        # Use the existing merge commit, just update the branch ref
+        try:
+            try:
+                utils.github_set_ref(state.get_repo(), 'heads/' +
+                                     state.base_ref, state.merge_sha)
+            except github3.exceptions.GitHubError:
+                state.get_repo().create_status(
+                    state.merge_sha,
+                    'success', '',
+                    'Branch protection bypassed',
+                    context='homu')
+                utils.github_set_ref(state.get_repo(), 'heads/' +
+                                     state.base_ref, state.merge_sha)
+        except github3.exceptions.GitHubError as e:
+            state.set_status('error')
+            desc = ('Test was successful, but fast-forwarding failed:'
+                    ' {}'.format(e))
+            state.get_repo().create_status(state.head_sha, 'error', url,
+                                           desc, context='homu')
+
+            state.add_comment(':eyes: ' + desc)
+            return False
 
     if not merge_sha:
         return False
@@ -920,9 +944,8 @@ def try_travis_exemption(state, logger, repo_cfg, git_cfg):
 
     if (travis_commit.parents[0]['sha'] == base_sha and
             travis_commit.parents[1]['sha'] == state.head_sha):
-        # make sure we check against the github merge sha before pushing
         return do_exemption_merge(state, logger, repo_cfg, git_cfg,
-                                  travis_info.target_url, True,
+                                  travis_info.target_url, travis_sha,
                                   "merge already tested by Travis CI")
 
     return False
@@ -965,7 +988,7 @@ def try_status_exemption(state, logger, repo_cfg, git_cfg):
     # is the PR fully rebased?
     base_sha = state.get_repo().ref('heads/' + state.base_ref).object.sha
     if pull_is_rebased(state, repo_cfg, git_cfg, base_sha, logger):
-        return do_exemption_merge(state, logger, repo_cfg, git_cfg, '', False,
+        return do_exemption_merge(state, logger, repo_cfg, git_cfg, '', None,
                                   "pull fully rebased and already tested")
 
     logger.info("pull is not fully rebased, {} {}".format(state.head_sha, base_sha))
@@ -984,8 +1007,7 @@ def try_status_exemption(state, logger, repo_cfg, git_cfg):
     if (statuses_all == statuses_merge_pass and
             merge_commit.parents[0]['sha'] == base_sha and
             merge_commit.parents[1]['sha'] == state.head_sha):
-        # make sure we check against the github merge sha before pushing
-        return do_exemption_merge(state, logger, repo_cfg, git_cfg, '', True,
+        return do_exemption_merge(state, logger, repo_cfg, git_cfg, '', merge_sha,
                                   "merge already tested")
 
     logger.info("merge commit didn't succeed")
