@@ -830,10 +830,13 @@ def create_merge(state, repo_cfg, branch, logger, git_cfg,
 
 def pull_is_rebased(state, repo_cfg, git_cfg, base_sha, logger):
     cx = state.get_repo().compare_commits(base_sha, state.head_sha)
-    logger.debug("pull_is_rebased, comparison {!r}".format(cx))
+    logger.debug("pull_is_rebased, comparison {} ~ {}, ahead {}, behind {} ".format(
+        cx.base_commit.sha, base_sha, cx.behind_by, cx.ahead_by
+    ))
     if cx.behind_by == 0:
         assert cx.base_commit.sha == base_sha
         return True
+    return False
 
 # We could fetch this from GitHub instead, but that API is being deprecated:
 # https://developer.github.com/changes/2013-04-25-deprecating-merge-commit-sha/
