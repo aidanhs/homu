@@ -831,7 +831,7 @@ def create_merge(state, repo_cfg, branch, logger, git_cfg,
 def pull_is_rebased(state, repo_cfg, git_cfg, base_sha, logger):
     cx = state.get_repo().compare_commits(base_sha, state.head_sha)
     logger.debug("pull_is_rebased, comparison {} ~ {}, ahead {}, behind {} ".format(
-        cx.base_commit.sha, base_sha, cx.behind_by, cx.ahead_by
+        cx.base_commit.sha, base_sha, cx.ahead_by, cx.behind_by
     ))
     if cx.behind_by == 0:
         assert cx.base_commit.sha == base_sha
@@ -857,8 +857,12 @@ def do_exemption_merge(state, logger, repo_cfg, git_cfg, url, check_merge,
                        reason):
 
     min_approval = repo_cfg.get('min_approval_required', 1)
+    desc = 'Test exempted'
+
     assert state.approved_by
     if len(state.approved_by) < min_approval:
+        state.get_repo().create_status(state.head_sha, 'success', url, desc, context='homu')
+        state.add_comment(':zap: {}: {}.'.format(desc, reason))
         return True
 
     try:
@@ -876,8 +880,6 @@ def do_exemption_merge(state, logger, repo_cfg, git_cfg, url, check_merge,
 
     if not merge_sha:
         return False
-
-    desc = 'Test exempted'
 
     state.set_status('success')
     state.get_repo().create_status(state.head_sha, 'success',
