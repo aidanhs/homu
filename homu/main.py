@@ -828,16 +828,12 @@ def create_merge(state, repo_cfg, branch, logger, git_cfg,
     return ''
 
 
-def pull_is_rebased(state, repo_cfg, git_cfg, base_sha):
-    assert git_cfg['local_git']
-    git_cmd = init_local_git_cmds(repo_cfg, git_cfg)
-
-    utils.logged_call(git_cmd('fetch', 'origin', state.base_ref,
-                              'pull/{}/head'.format(state.num)))
-
-    return utils.silent_call(git_cmd('merge-base', '--is-ancestor',
-                                     base_sha, state.head_sha)) == 0
-
+def pull_is_rebased(state, repo_cfg, git_cfg, base_sha, logger):
+    cx = state.get_repo().compare_commits(base_sha, state.head_sha)
+    logger.debug("pull_is_rebased, comparison {!r}".format(cx))
+    if cx.behind_by == 0:
+        assert cx.base_commit.sha == base_sha
+        return True
 
 # We could fetch this from GitHub instead, but that API is being deprecated:
 # https://developer.github.com/changes/2013-04-25-deprecating-merge-commit-sha/
@@ -945,9 +941,6 @@ def try_status_exemption(state, logger, repo_cfg, git_cfg):
     #      state 'success' and the merge commit's first parent is the HEAD of
     #      the target base ref.
 
-    if not git_cfg['local_git']:
-        raise RuntimeError('local_git is required to use status exemption')
-
     statuses_all = set()
 
     # equivalence dict: pr context --> auto context
@@ -974,7 +967,7 @@ def try_status_exemption(state, logger, repo_cfg, git_cfg):
 
     # is the PR fully rebased?
     base_sha = state.get_repo().ref('heads/' + state.base_ref).object.sha
-    if pull_is_rebased(state, repo_cfg, git_cfg, base_sha):
+    if pull_is_rebased(state, repo_cfg, git_cfg, base_sha, logger):
         return do_exemption_merge(state, logger, repo_cfg, git_cfg, '', False,
                                   "pull fully rebased and already tested")
 
