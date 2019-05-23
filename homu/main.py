@@ -828,57 +828,74 @@ def create_merge(state, repo_cfg, branch, logger, git_cfg,
     return ''
 
 
-def pull_is_rebased(state, repo_cfg, git_cfg, base_sha):
-    assert git_cfg['local_git']
-    git_cmd = init_local_git_cmds(repo_cfg, git_cfg)
+def pull_is_rebased(state, repo_cfg, git_cfg, base_sha, logger):
+    cx = state.get_repo().compare_commits(base_sha, state.head_sha)
+    logger.debug("pull_is_rebased, comparison {} ~ {}, ahead {}, behind {} ".format(
+        cx.base_commit.sha, base_sha, cx.ahead_by, cx.behind_by
+    ))
+    if cx.behind_by == 0:
+        assert cx.base_commit.sha == base_sha
+        return True
+    return False
 
-    utils.logged_call(git_cmd('fetch', 'origin', state.base_ref,
-                              'pull/{}/head'.format(state.num)))
-
-    return utils.silent_call(git_cmd('merge-base', '--is-ancestor',
-                                     base_sha, state.head_sha)) == 0
-
-
-# We could fetch this from GitHub instead, but that API is being deprecated:
-# https://developer.github.com/changes/2013-04-25-deprecating-merge-commit-sha/
-def get_github_merge_sha(state, repo_cfg, git_cfg):
-    assert git_cfg['local_git']
-    git_cmd = init_local_git_cmds(repo_cfg, git_cfg)
-
-    if state.mergeable is not True:
-        return None
-
-    utils.logged_call(git_cmd('fetch', 'origin',
-                              'pull/{}/merge'.format(state.num)))
-
-    return subprocess.check_output(git_cmd('rev-parse', 'FETCH_HEAD')).decode('ascii').strip()  # noqa
+def get_homu_merge_sha(state, repo_cfg, git_cfg):
+    # Return the latest merge commit we created
+    if state.merge_sha != '':
+        return state.merge_sha
+    return None
 
 
-def do_exemption_merge(state, logger, repo_cfg, git_cfg, url, check_merge,
+def do_exemption_merge(state, logger, repo_cfg, git_cfg, url, merge_sha,
                        reason):
 
     min_approval = repo_cfg.get('min_approval_required', 1)
+    desc = 'Test exempted'
+
     assert state.approved_by
     if len(state.approved_by) < min_approval:
+        state.get_repo().create_status(state.head_sha, 'success', url, desc, context='homu')
+        state.add_comment(':zap: {}: {}.'.format(desc, reason))
         return True
 
-    try:
-        merge_sha = create_merge(
-            state,
-            repo_cfg,
-            state.base_ref,
-            logger,
-            git_cfg,
-            check_merge)
-    except subprocess.CalledProcessError:
-        print('* Unable to create a merge commit for the exempted PR: {}'.format(state))  # noqa
-        traceback.print_exc()
-        return False
+    if merge_sha is None:
+        # We haven't merged, create a merge now
+        try:
+            merge_sha = create_merge(
+                state,
+                repo_cfg,
+                state.base_ref,
+                logger,
+                git_cfg)
+        except subprocess.CalledProcessError:
+            print('* Unable to create a merge commit for the exempted PR: {}'.format(state))  # noqa
+            traceback.print_exc()
+            return False
+    else:
+        # Use the existing merge commit, just update the branch ref
+        try:
+            try:
+                utils.github_set_ref(state.get_repo(), 'heads/' +
+                                     state.base_ref, state.merge_sha)
+            except github3.exceptions.GitHubError:
+                state.get_repo().create_status(
+                    state.merge_sha,
+                    'success', '',
+                    'Branch protection bypassed',
+                    context='homu')
+                utils.github_set_ref(state.get_repo(), 'heads/' +
+                                     state.base_ref, state.merge_sha)
+        except github3.exceptions.GitHubError as e:
+            state.set_status('error')
+            desc = ('Test was successful, but fast-forwarding failed:'
+                    ' {}'.format(e))
+            state.get_repo().create_status(state.head_sha, 'error', url,
+                                           desc, context='homu')
+
+            state.add_comment(':eyes: ' + desc)
+            return False
 
     if not merge_sha:
         return False
-
-    desc = 'Test exempted'
 
     state.set_status('success')
     state.get_repo().create_status(state.head_sha, 'success',
@@ -927,9 +944,8 @@ def try_travis_exemption(state, logger, repo_cfg, git_cfg):
 
     if (travis_commit.parents[0]['sha'] == base_sha and
             travis_commit.parents[1]['sha'] == state.head_sha):
-        # make sure we check against the github merge sha before pushing
         return do_exemption_merge(state, logger, repo_cfg, git_cfg,
-                                  travis_info.target_url, True,
+                                  travis_info.target_url, travis_sha,
                                   "merge already tested by Travis CI")
 
     return False
@@ -944,9 +960,6 @@ def try_status_exemption(state, logger, repo_cfg, git_cfg):
     #   2. The PR head and merge commits have the equivalent statuses set to
     #      state 'success' and the merge commit's first parent is the HEAD of
     #      the target base ref.
-
-    if not git_cfg['local_git']:
-        raise RuntimeError('local_git is required to use status exemption')
 
     statuses_all = set()
 
@@ -965,6 +978,7 @@ def try_status_exemption(state, logger, repo_cfg, git_cfg):
     # let's first check that all the statuses we want are set to success
     statuses_pass = set()
     for info in state.get_repo().statuses(state.head_sha):
+        lazy_debug(logger, lambda: "exempt: info: {!r}".format(info))
         if info.context in status_equivalences and info.state == 'success':
             statuses_pass.add(status_equivalences[info.context])
 
@@ -973,13 +987,15 @@ def try_status_exemption(state, logger, repo_cfg, git_cfg):
 
     # is the PR fully rebased?
     base_sha = state.get_repo().ref('heads/' + state.base_ref).object.sha
-    if pull_is_rebased(state, repo_cfg, git_cfg, base_sha):
-        return do_exemption_merge(state, logger, repo_cfg, git_cfg, '', False,
+    if pull_is_rebased(state, repo_cfg, git_cfg, base_sha, logger):
+        return do_exemption_merge(state, logger, repo_cfg, git_cfg, '', None,
                                   "pull fully rebased and already tested")
 
+    logger.info("pull is not fully rebased, {} {}".format(state.head_sha, base_sha))
     # check if we can use the github merge sha as proof
-    merge_sha = get_github_merge_sha(state, repo_cfg, git_cfg)
+    merge_sha = get_homu_merge_sha(state, repo_cfg, git_cfg)
     if merge_sha is None:
+        logger.info("No merge sha found")
         return False
 
     statuses_merge_pass = set()
@@ -991,10 +1007,10 @@ def try_status_exemption(state, logger, repo_cfg, git_cfg):
     if (statuses_all == statuses_merge_pass and
             merge_commit.parents[0]['sha'] == base_sha and
             merge_commit.parents[1]['sha'] == state.head_sha):
-        # make sure we check against the github merge sha before pushing
-        return do_exemption_merge(state, logger, repo_cfg, git_cfg, '', True,
+        return do_exemption_merge(state, logger, repo_cfg, git_cfg, '', merge_sha,
                                   "merge already tested")
 
+    logger.info("merge commit didn't succeed")
     return False
 
 
